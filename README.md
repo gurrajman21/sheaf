@@ -39,7 +39,7 @@ minutes the first time.
 ### 2. Build the app
 
 ```bash
-git clone https://github.com/<you>/sheaf.git
+git clone https://github.com/gurrajman21/sheaf.git
 cd sheaf/apps/sheets
 npm install
 npx tauri build --bundles app
