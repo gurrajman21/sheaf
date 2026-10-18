@@ -86,7 +86,17 @@ enum Change {
     Replace,
     Add,
     Value,
+    /// Array formula whose spill range changed: new value, and its `ref` follows IronCalc's.
+    Resize,
     Remove,
+}
+
+/// Spill range (width, height) of an array formula anchor.
+fn array_size(c: &Cell) -> Option<(i32, i32)> {
+    match c {
+        Cell::ArrayFormula { r, .. } => Some(*r),
+        _ => None,
+    }
 }
 
 pub fn save_patched(original: &[u8], base: &Model, work: &Model) -> Result<(Vec<u8>, PatchReport), String> {
@@ -176,6 +186,9 @@ pub fn save_patched_ops(
                 }
                 Some(b) if content(&b, &bws.shared_formulas) != content(&w, &ws.shared_formulas) => {
                     d.insert((r, c), Change::Replace);
+                }
+                Some(b) if array_size(&b) != array_size(&w) => {
+                    d.insert((r, c), Change::Resize);
                 }
                 Some(b) if b != *w => {
                     d.insert((r, c), Change::Value);
@@ -290,10 +303,16 @@ pub fn save_patched_ops(
                     }
                     CellEdit::Replace(adopt_cell(t, styles.as_mut(), &mut strings, w_strings)?)
                 }
-                (Change::Value, t) => match (o_cells.get(&pos), t) {
+                (Change::Value | Change::Resize, t) => match (o_cells.get(&pos), t) {
                     (Some(o), Some(t)) => {
                         report.values_updated += 1;
-                        CellEdit::Replace(patch_value(o, t, &mut strings, w_strings)?)
+                        let mut x = patch_value(o, t, &mut strings, w_strings)?;
+                        if matches!(change, Change::Resize) {
+                            // the old ref would leave new spill cells outside the array (#SPILL!
+                            // on reopen) and stale ones inside it
+                            x = set_array_ref(&x, array_ref(t).ok_or("resized array without ref")?);
+                        }
+                        CellEdit::Replace(x)
                     }
                     // cell exists only implicitly in the original (e.g. inside a spill): take IronCalc's
                     (None, Some(t)) => {
@@ -487,6 +506,21 @@ fn adopt_cell(t_cell: &str, styles: Option<&mut StyleTable>, strings: &mut Strin
     Ok(format!("{new_tag}{body}</c>"))
 }
 
+/// `ref` of a cell's `<f t="array">`.
+fn array_ref(cell: &str) -> Option<&str> {
+    let tk = tokens(cell).find(|t| t.local() == "f" && matches!(t.kind, Kind::Start | Kind::Empty))?;
+    let tag = &cell[tk.start..tk.end];
+    (attr(tag, "t") == Some("array")).then(|| attr(tag, "ref")).flatten()
+}
+
+/// Set the `ref` of a cell's `<f>`.
+fn set_array_ref(cell: &str, new_ref: &str) -> String {
+    match tokens(cell).find(|t| t.local() == "f" && matches!(t.kind, Kind::Start | Kind::Empty)) {
+        Some(tk) => format!("{}{}{}", &cell[..tk.start], set_attr(&cell[tk.start..tk.end], "ref", Some(new_ref)), &cell[tk.end..]),
+        None => cell.to_string(),
+    }
+}
+
 /// Keep the original cell (formula, attributes, extensions) and replace only its cached value.
 fn patch_value(orig: &str, t_cell: &str, strings: &mut StringTable, w_strings: &[String]) -> Result<String, String> {
     let (t, v) = value_of(t_cell, strings, w_strings)?;
@@ -527,6 +561,58 @@ mod tests {
         let none: Vec<String> = Vec::new();
         let out = patch_value(r#"<c r="B2" s="4" cm="1"><f t="shared" si="0"/><v>1</v></c>"#, r#"<c r="B2" s="9" t="str"><f>X</f><v>hi</v></c>"#, &mut st, &none).unwrap();
         assert_eq!(out, r#"<c r="B2" s="4" cm="1" t="str"><f t="shared" si="0"/><v>hi</v></c>"#);
+    }
+
+    #[test]
+    fn resized_array_takes_new_ref() {
+        let mut st = StringTable::parse(None);
+        let none: Vec<String> = Vec::new();
+        let orig = r#"<c r="F1" cm="1"><f t="array" ref="F1:F2">_xlfn._xlws.FILTER(A1:A7,A1:A7&gt;5)</f><v>8</v></c>"#;
+        let t = r#"<c r="F1" cm="1"><f t="array" ref="F1:F3">_xlfn._xlws.FILTER(A1:A7,A1:A7&gt;5)</f><v>9</v></c>"#;
+        assert_eq!(array_ref(t), Some("F1:F3"));
+        let out = set_array_ref(&patch_value(orig, t, &mut st, &none).unwrap(), array_ref(t).unwrap());
+        assert_eq!(out, r#"<c r="F1" cm="1"><f t="array" ref="F1:F3">_xlfn._xlws.FILTER(A1:A7,A1:A7&gt;5)</f><v>9</v></c>"#);
+    }
+
+    /// End to end: an edit that makes FILTER return more rows grows the anchor's ref, writes the
+    /// new spill cell as a plain value inside it, and the file reopens without #SPILL!.
+    #[test]
+    fn spill_range_follows_edit() {
+        let mut m = Model::new_empty("t", "en", "UTC", "en").unwrap();
+        for (r, v) in [(1, "5"), (2, "3"), (3, "8"), (4, "1")] {
+            m.set_user_input(0, r, 1, v.into()).unwrap();
+        }
+        m.set_user_input(0, 1, 6, "=FILTER(A1:A4,A1:A4>4)".into()).unwrap();
+        m.evaluate();
+        let orig = ironcalc::export::save_xlsx_to_writer(&m, Cursor::new(Vec::new())).unwrap().into_inner();
+        let load = |b: &[u8]| {
+            let wb = ironcalc::import::load_from_xlsx_bytes(b, "t", "en", "UTC").unwrap();
+            let mut m = Model::from_workbook(wb, "en").unwrap();
+            m.evaluate();
+            m
+        };
+        let base = load(&orig);
+        let mut work = load(&orig);
+        work.set_user_input(0, 2, 1, "7".into()).unwrap(); // A2: 3 -> 7, FILTER now 3 rows
+        work.evaluate();
+        let (out, _) = save_patched(&orig, &base, &work).unwrap();
+        let back = load(&out);
+        for r in 1..=3 {
+            assert_eq!(back.get_formatted_cell_value(0, r, 6).unwrap(), work.get_formatted_cell_value(0, r, 6).unwrap(), "F{r}");
+        }
+        assert_eq!(back.get_formatted_cell_value(0, 3, 6).unwrap(), "8");
+
+        // and shrinking back drops the cell that left the spill
+        let mut work2 = load(&out);
+        work2.set_user_input(0, 2, 1, "3".into()).unwrap();
+        work2.set_user_input(0, 3, 1, "2".into()).unwrap(); // FILTER now 1 row
+        work2.evaluate();
+        let base2 = load(&out);
+        let (out2, _) = save_patched(&out, &base2, &work2).unwrap();
+        let back2 = load(&out2);
+        assert_eq!(back2.get_formatted_cell_value(0, 1, 6).unwrap(), "5");
+        assert_eq!(back2.get_formatted_cell_value(0, 2, 6).unwrap(), "");
+        assert_eq!(back2.get_formatted_cell_value(0, 3, 6).unwrap(), "");
     }
 
     #[test]
