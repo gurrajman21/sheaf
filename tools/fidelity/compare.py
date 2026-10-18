@@ -89,12 +89,20 @@ def _ratio(kept: int, total: int) -> list[int]:
     return [kept, total]
 
 
-def make_edits(pkg: Package) -> dict | None:
+STRUCTURAL = ("insert_rows", "delete_rows", "insert_cols", "delete_cols")
+INSERTED_ROWS = 2
+
+
+def make_edits(pkg: Package, insert_rows: bool = False) -> dict | None:
     """A deterministic edit script for one file: what a user might do in a quick session.
 
     Changes a number, a text cell (preferring one below the header row) and a cell's
     font, then adds a formula that depends on the changed number and a new text
     cell below the data. Cells inside merged ranges are avoided.
+
+    With `insert_rows`, the script starts by inserting two rows in the middle of the
+    edited sheet's data (below the header and any frozen rows, not splitting an array
+    formula); the cell edits that follow are addressed after the shift.
     """
     for sh in pkg.sheets:
         if sh.state != "visible":
@@ -115,24 +123,75 @@ def make_edits(pkg: Package) -> dict | None:
         bold = next((p for p in consts if p not in (num, txt)), None)
         new_row = max(r for r, _ in sh.cells) + 2
         overwrite = _formula_to_overwrite(pkg)
-        ref = lambda p: f"{num_to_col(p[1])}{p[0]}"
         edits = []
+        at = _insert_point(sh) if insert_rows else None
+        if at:
+            edits.append({"op": "insert_rows", "at": at, "count": INSERTED_ROWS})
+        moved = lambda p: (p[0] + INSERTED_ROWS, p[1]) if at and p[0] >= at else p
+        ref = lambda p: f"{num_to_col(p[1])}{moved(p)[0]}"
         if num:
             edits.append({"op": "number", "cell": ref(num), "value": 4242.25})
         if txt:
             edits.append({"op": "text", "cell": ref(txt), "value": "edited ✓ 編集"})
         if bold:
             edits.append({"op": "bold", "cell": ref(bold), "was": list(val(bold))})
-        edits.append({"op": "formula", "cell": f"A{new_row}", "value": f"={ref(num)}*2" if num else "=1+1",
+        edits.append({"op": "formula", "cell": ref((new_row, 1)), "value": f"={ref(num)}*2" if num else "=1+1",
                       "expected": 8484.5 if num else 2})
-        edits.append({"op": "text", "cell": f"B{new_row}", "value": "new cell"})
+        edits.append({"op": "text", "cell": ref((new_row, 2)), "value": "new cell"})
         for e in edits:
             e["sheet"] = sh.name
         if overwrite:
             # typing over a formula; prefers a shared-formula master, the riskiest case
-            edits.append({"op": "number", "sheet": overwrite[0], "cell": overwrite[1], "value": 77.0})
+            o_sheet, o_ref = overwrite
+            pos = ooxml.parse_ref(o_ref)
+            if o_sheet == sh.name:
+                o_ref = ref(pos)
+            edits.append({"op": "number", "sheet": o_sheet, "cell": o_ref, "value": 77.0})
         return {"sheet": sh.name, "edits": edits}
     return None
+
+
+def _insert_point(sh) -> int | None:
+    """A row in the middle of the sheet's data where inserting rows splits nothing."""
+    rows = sorted({r for r, _ in sh.cells})
+    first = max(2, (sh.frozen[1] if sh.frozen else 0) + 1)
+    rows = [r for r in rows if r > first]
+    if not rows:
+        return None
+    arrays = []
+    for ref in sh.array_ranges:
+        if ":" in ref:
+            (r1, _), (r2, _) = (ooxml.parse_ref(x) for x in ref.split(":"))
+            arrays.append((r1, r2))
+    for r in rows[len(rows) // 2:] + rows[: len(rows) // 2][::-1]:
+        if not any(r1 < r <= r2 for r1, r2 in arrays):
+            return r
+    return None
+
+
+def row_shifts(script: dict | None) -> dict[str, list[tuple[int, int]]]:
+    """Row inserts per sheet, in order, from an edit script."""
+    out: dict[str, list[tuple[int, int]]] = {}
+    for e in (script or {}).get("edits", []):
+        if e["op"] == "insert_rows":
+            out.setdefault(e["sheet"], []).append((e["at"], e["count"]))
+    return out
+
+
+def _mover(shifts: list[tuple[int, int]]):
+    def row(r: int) -> int:
+        for at, n in shifts:
+            if r >= at:
+                r += n
+        return r
+    return row
+
+
+def _move_range(ref: str, row) -> str:
+    def one(x: str) -> str:
+        r, c = ooxml.parse_ref(x)
+        return f"{num_to_col(c)}{row(r)}"
+    return ":".join(one(x) for x in ref.split(":"))
 
 
 def _formula_to_overwrite(pkg: Package) -> tuple[str, str] | None:
@@ -153,15 +212,24 @@ def _formula_to_overwrite(pkg: Package) -> tuple[str, str] | None:
 def edited_cells(script: dict | None) -> set:
     if not script:
         return set()
-    return {(e["sheet"], *ooxml.parse_ref(e["cell"])) for e in script["edits"]}
+    return {(e["sheet"], *ooxml.parse_ref(e["cell"])) for e in script["edits"] if "cell" in e}
 
 
 def check_edits(rt: Package, script: dict) -> dict:
     ok, fails = 0, []
     for e in script["edits"]:
         sh = rt.sheet(e["sheet"])
-        cell = sh.cells.get(ooxml.parse_ref(e["cell"])) if sh else None
         op = e["op"]
+        if op in STRUCTURAL:
+            # inserted rows exist and are empty (the rest of the shift is scored by compare_packages)
+            rows = range(e["at"], e["at"] + e.get("count", 1))
+            good = sh is not None and not any(
+                r in rows and (c.value is not None or c.formula is not None) for (r, _), c in sh.cells.items())
+            ok += good
+            if not good:
+                fails.append({"op": op, "cell": f"row {e['at']}", "got": None})
+            continue
+        cell = sh.cells.get(ooxml.parse_ref(e["cell"])) if sh else None
         if cell is None:
             good = False
         elif op == "number":
@@ -182,8 +250,11 @@ def check_edits(rt: Package, script: dict) -> dict:
     return {"ok": ok, "total": len(script["edits"]), "failures": fails}
 
 
-def compare_packages(orig: Package, rt: Package, exclude: set | None = None) -> dict:
+def compare_packages(orig: Package, rt: Package, exclude: set | None = None,
+                     shifts: dict[str, list[tuple[int, int]]] | None = None) -> dict:
+    """`shifts` (from `row_shifts`) maps original rows to where an insert moved them."""
     exclude = exclude or set()
+    shifts = shifts or {}
     values = [0, 0]
     formulas = [0, 0]
     style_parts = ("numfmt", "font", "fill", "border", "alignment")
@@ -198,10 +269,12 @@ def compare_packages(orig: Package, rt: Package, exclude: set | None = None) -> 
     for sh in orig.sheets:
         rs = rt.sheet(sh.name)
         rcells = rs.cells if rs else {}
+        row = _mover(shifts.get(sh.name, []))
         for pos, cell in sh.cells.items():
-            if (sh.name, *pos) in exclude:
+            moved = (row(pos[0]), pos[1])
+            if (sh.name, *moved) in exclude:
                 continue
-            rc = rcells.get(pos)
+            rc = rcells.get(moved)
             if cell.formula is None and cell.value is not None and not sh.in_array_output(pos):
                 values[1] += 1
                 ok = _kept_constant(cell.value, rc)
@@ -227,16 +300,17 @@ def compare_packages(orig: Package, rt: Package, exclude: set | None = None) -> 
 
         # layout
         rm = rs.merged if rs else set()
-        layout["merged"] = _add(layout["merged"], len(sh.merged & rm), len(sh.merged))
+        merged = {_move_range(m, row) for m in sh.merged} if sh.name in shifts else sh.merged
+        layout["merged"] = _add(layout["merged"], len(merged & rm), len(sh.merged))
         rw = rs.col_widths if rs else {}
         layout["col_widths"] = _add(layout["col_widths"],
                                     sum(1 for c, w in sh.col_widths.items() if c in rw and abs(rw[c] - w) <= 0.5),
                                     len(sh.col_widths))
         rh = rs.row_heights if rs else {}
         layout["row_heights"] = _add(layout["row_heights"],
-                                     sum(1 for r, h in sh.row_heights.items() if r in rh and abs(rh[r] - h) <= 0.5),
+                                     sum(1 for r, h in sh.row_heights.items() if row(r) in rh and abs(rh[row(r)] - h) <= 0.5),
                                      len(sh.row_heights))
-        layout["hidden_rows"] = _add(layout["hidden_rows"], len(sh.hidden_rows & (rs.hidden_rows if rs else set())),
+        layout["hidden_rows"] = _add(layout["hidden_rows"], len({row(r) for r in sh.hidden_rows} & (rs.hidden_rows if rs else set())),
                                      len(sh.hidden_rows))
         layout["hidden_cols"] = _add(layout["hidden_cols"], len(sh.hidden_cols & (rs.hidden_cols if rs else set())),
                                      len(sh.hidden_cols))

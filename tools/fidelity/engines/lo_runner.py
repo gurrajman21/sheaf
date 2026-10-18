@@ -72,8 +72,11 @@ def apply_edits(doc, edits, out):
     errors = []
     for e in edits:
         try:
-            cell = doc.Sheets.getByName(e["sheet"]).getCellRangeByName(e["cell"])
             op = e["op"]
+            if op == "insert_rows":
+                doc.Sheets.getByName(e["sheet"]).Rows.insertByIndex(e["at"] - 1, e.get("count", 1))
+                continue
+            cell = doc.Sheets.getByName(e["sheet"]).getCellRangeByName(e["cell"])
             if op == "number":
                 cell.setValue(e["value"])
             elif op == "text":
@@ -85,7 +88,7 @@ def apply_edits(doc, edits, out):
             else:
                 raise RuntimeError("unknown op %s" % op)
         except Exception as ex:
-            errors.append("%s: %s" % (e.get("cell"), ex))
+            errors.append("%s: %s" % (e.get("cell", op), ex))
     if errors:
         out["edit_errors"] = errors
 
