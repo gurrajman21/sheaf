@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Rust
+target/
+
+# Corpus: only scripts and docs are committed. Files are generated/fetched locally.
+corpus/synthetic/*
+!corpus/synthetic/.gitkeep
+corpus/public/*
+!corpus/public/.gitkeep
+!corpus/public/SOURCES.lock
+corpus/real/*
+!corpus/real/.gitkeep
+
+# Harness output
+results/
+tools/fidelity/.lo-profile/
+
+.DS_Store
