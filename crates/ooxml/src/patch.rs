@@ -15,6 +15,11 @@
 //!    dropped when any cell changed (Excel rebuilds it).
 //! 4. Every other part is raw-copied from the original zip.
 //!
+//! Row/column inserts and deletes come in as an explicit operation log
+//! ([`StructuralOp`]): the same ops are replayed on a copy of the baseline
+//! model (so the cell diff above compares like with like) and on the original
+//! XML, where every reference to the edited sheet is shifted (see `structural`).
+//!
 //! Anything the edits changed that this writer can't express yet (merges,
 //! column widths, sheet add/rename, ...) is refused with an error rather than
 //! silently lost.
@@ -28,6 +33,7 @@ use serde::Serialize;
 
 use crate::package::{append_to_root, remove_elements, resolve, Package};
 use crate::sheet::{self, CellEdit};
+pub use crate::structural::StructuralOp;
 use crate::tables::{StringTable, StyleTable};
 use crate::xml::{self, attr, set_attr, tokens, Kind, Tok};
 
@@ -43,6 +49,8 @@ pub struct PatchReport {
     pub strings_added: usize,
     pub styles_added: usize,
     pub calc_chain_removed: bool,
+    /// Structural ops replayed on the package.
+    pub structural_ops: usize,
     pub parts_rewritten: Vec<String>,
 }
 
@@ -53,20 +61,23 @@ enum Content {
     Num(u64),
     Error(String),
     Str(i32),
-    Formula(i32),
-    Array(i32, String),
+    Formula(String),
+    Array(String, String),
     Spill(i32, i32),
 }
 
-fn content(c: &Cell) -> (Content, i32) {
+/// Formulas are compared by text, not by their index in the sheet's formula list:
+/// structural ops re-add displaced formulas, so indices aren't stable across models.
+fn content(c: &Cell, formulas: &[String]) -> (Content, i32) {
+    let text = |f: i32| formulas.get(f as usize).cloned().unwrap_or_default();
     match c {
         Cell::EmptyCell { s } => (Content::Empty, *s),
         Cell::BooleanCell { v, s } => (Content::Bool(*v), *s),
         Cell::NumberCell { v, s } => (Content::Num(v.to_bits()), *s),
         Cell::ErrorCell { ei, s } => (Content::Error(ei.to_string()), *s),
         Cell::SharedString { si, s } => (Content::Str(*si), *s),
-        Cell::CellFormula { f, s, .. } => (Content::Formula(*f), *s),
-        Cell::ArrayFormula { f, s, kind, .. } => (Content::Array(*f, format!("{kind:?}")), *s),
+        Cell::CellFormula { f, s, .. } => (Content::Formula(text(*f)), *s),
+        Cell::ArrayFormula { f, s, kind, .. } => (Content::Array(text(*f), format!("{kind:?}")), *s),
         Cell::SpillCell { s, a, .. } => (Content::Spill(a.0, a.1), *s),
     }
 }
@@ -75,10 +86,46 @@ enum Change {
     Replace,
     Add,
     Value,
+    /// Array formula whose spill range changed: new value, and its `ref` follows IronCalc's.
+    Resize,
     Remove,
 }
 
+/// Spill range (width, height) of an array formula anchor.
+fn array_size(c: &Cell) -> Option<(i32, i32)> {
+    match c {
+        Cell::ArrayFormula { r, .. } => Some(*r),
+        _ => None,
+    }
+}
+
 pub fn save_patched(original: &[u8], base: &Model, work: &Model) -> Result<(Vec<u8>, PatchReport), String> {
+    save_patched_ops(original, base, work, &[])
+}
+
+/// Like [`save_patched`], for a working model that also had `ops` applied (in order).
+pub fn save_patched_ops(
+    original: &[u8],
+    base: &Model,
+    work: &Model,
+    ops: &[StructuralOp],
+) -> Result<(Vec<u8>, PatchReport), String> {
+    // the baseline with the same structural edits, so only real cell edits show in the diff
+    // style indices are relative to the file as loaded, before any op added styles
+    let st = &base.workbook.styles;
+    let style_counts = (st.cell_xfs.len(), st.fonts.len(), st.fills.len(), st.borders.len());
+    let shifted;
+    let base = if ops.is_empty() {
+        base
+    } else {
+        let mut m = Model::from_workbook(base.workbook.clone(), "en")?;
+        for op in ops {
+            op.apply(&mut m)?;
+        }
+        m.evaluate();
+        shifted = m;
+        &shifted
+    };
     check_unsupported(base, work)?;
     let mut report = PatchReport::default();
     let mut pkg = Package::open(original)?;
@@ -113,6 +160,15 @@ pub fn save_patched(original: &[u8], base: &Model, work: &Model) -> Result<(Vec<
             worksheets.iter().map(|w| &w.name).collect::<Vec<_>>()
         ));
     }
+    // ---- structural ops: shift the original package's references first
+    let mut overlay: BTreeMap<String, String> = BTreeMap::new();
+    let mut remat: BTreeMap<String, HashSet<(i32, i32)>> = BTreeMap::new();
+    for op in ops {
+        let i = op.sheet() as usize;
+        let name = &base.workbook.worksheets.get(i).ok_or("structural op on a missing sheet")?.name;
+        crate::structural::shift_package(&mut pkg, &mut overlay, &wb_path, &sheet_parts, &op.to_shift(name), &mut remat)?;
+    }
+    report.structural_ops = ops.len();
     let sst_rel = wb_rels.iter().find(|r| r.kind.ends_with("/sharedStrings"));
     let styles_rel = wb_rels.iter().find(|r| r.kind.ends_with("/styles"));
     let calc_rel = wb_rels.iter().find(|r| r.kind.ends_with("/calcChain"));
@@ -120,19 +176,19 @@ pub fn save_patched(original: &[u8], base: &Model, work: &Model) -> Result<(Vec<
     // ---- diff every sheet first; most saves touch one or two
     let mut diffs: Vec<BTreeMap<(i32, i32), Change>> = Vec::new();
     for (i, ws) in worksheets.iter().enumerate() {
-        let mut base_cells: HashMap<(i32, i32), Cell> = base.workbook.worksheets[i]
-            .sheet_data
-            .cells()
-            .map(|(r, c, cell)| ((r, c), cell.into_owned()))
-            .collect();
+        let bws = &base.workbook.worksheets[i];
+        let mut base_cells: HashMap<(i32, i32), Cell> = bws.sheet_data.cells().map(|(r, c, cell)| ((r, c), cell.into_owned())).collect();
         let mut d = BTreeMap::new();
         for (r, c, w) in ws.sheet_data.cells() {
             match base_cells.remove(&(r, c)) {
                 None => {
                     d.insert((r, c), Change::Add);
                 }
-                Some(b) if content(&b) != content(&w) => {
+                Some(b) if content(&b, &bws.shared_formulas) != content(&w, &ws.shared_formulas) => {
                     d.insert((r, c), Change::Replace);
+                }
+                Some(b) if array_size(&b) != array_size(&w) => {
+                    d.insert((r, c), Change::Resize);
                 }
                 Some(b) if b != *w => {
                     d.insert((r, c), Change::Value);
@@ -145,7 +201,7 @@ pub fn save_patched(original: &[u8], base: &Model, work: &Model) -> Result<(Vec<
         }
         diffs.push(d);
     }
-    if diffs.iter().all(BTreeMap::is_empty) {
+    if diffs.iter().all(BTreeMap::is_empty) && ops.is_empty() {
         // nothing changed: the original bytes are the best possible output
         return Ok((original.to_vec(), report));
     }
@@ -159,24 +215,23 @@ pub fn save_patched(original: &[u8], base: &Model, work: &Model) -> Result<(Vec<
         Some(r) if pkg.has(&r.target) => Some(pkg.read(&r.target)?),
         _ => None,
     });
-    let st = &base.workbook.styles;
     let mut styles = match styles_rel {
-        Some(r) if pkg.has(&r.target) => Some(StyleTable::new(
-            pkg.read(&r.target)?,
-            &tpkg.read("xl/styles.xml")?,
-            (st.cell_xfs.len(), st.fonts.len(), st.fills.len(), st.borders.len()),
-        )?),
+        Some(r) if pkg.has(&r.target) => Some(StyleTable::new(pkg.read(&r.target)?, &tpkg.read("xl/styles.xml")?, style_counts)?),
         _ => None,
     };
     let w_strings = &work.workbook.shared_strings;
 
     let mut replace: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     for (i, d) in diffs.iter().enumerate() {
-        if d.is_empty() {
+        let (_, part) = &sheet_parts[i];
+        let forced = remat.remove(part).unwrap_or_default();
+        if d.is_empty() && forced.is_empty() {
             continue;
         }
-        let (_, part) = &sheet_parts[i];
-        let orig_xml = pkg.read(part)?;
+        let orig_xml = match overlay.remove(part) {
+            Some(x) => x,
+            None => pkg.read(part)?,
+        };
         let orig = sheet::parse(&orig_xml)?;
         if orig.prefix.is_some() {
             return Err(format!("{part}: prefixed worksheet XML not supported"));
@@ -208,7 +263,7 @@ pub fn save_patched(original: &[u8], base: &Model, work: &Model) -> Result<(Vec<
                 }
             }
         }
-        let mut rematerialize: Vec<(i32, i32)> = Vec::new();
+        let mut rematerialize: Vec<(i32, i32)> = forced.into_iter().collect();
         for (master, members) in groups.values() {
             if let Some(m) = master {
                 if matches!(d.get(m), Some(Change::Replace | Change::Remove | Change::Add)) {
@@ -219,11 +274,15 @@ pub fn save_patched(original: &[u8], base: &Model, work: &Model) -> Result<(Vec<
 
         let mut edits = BTreeMap::new();
         let mut grew = false;
+        rematerialize.sort();
+        rematerialize.dedup();
         for pos in rematerialize {
-            if let Some(t) = t_cells.get(&pos) {
-                report.cells_rematerialized += 1;
-                edits.insert(pos, CellEdit::Replace(adopt_cell(t, styles.as_mut(), &mut strings, w_strings)?));
-            }
+            report.cells_rematerialized += 1;
+            let edit = match t_cells.get(&pos) {
+                Some(t) => CellEdit::Replace(adopt_cell(t, styles.as_mut(), &mut strings, w_strings)?),
+                None => CellEdit::Remove, // never leave a member whose master is gone
+            };
+            edits.insert(pos, edit);
         }
         for (&pos, change) in d {
             if edits.contains_key(&pos) {
@@ -244,10 +303,16 @@ pub fn save_patched(original: &[u8], base: &Model, work: &Model) -> Result<(Vec<
                     }
                     CellEdit::Replace(adopt_cell(t, styles.as_mut(), &mut strings, w_strings)?)
                 }
-                (Change::Value, t) => match (o_cells.get(&pos), t) {
+                (Change::Value | Change::Resize, t) => match (o_cells.get(&pos), t) {
                     (Some(o), Some(t)) => {
                         report.values_updated += 1;
-                        CellEdit::Replace(patch_value(o, t, &mut strings, w_strings)?)
+                        let mut x = patch_value(o, t, &mut strings, w_strings)?;
+                        if matches!(change, Change::Resize) {
+                            // the old ref would leave new spill cells outside the array (#SPILL!
+                            // on reopen) and stale ones inside it
+                            x = set_array_ref(&x, array_ref(t).ok_or("resized array without ref")?);
+                        }
+                        CellEdit::Replace(x)
                     }
                     // cell exists only implicitly in the original (e.g. inside a spill): take IronCalc's
                     (None, Some(t)) => {
@@ -275,6 +340,10 @@ pub fn save_patched(original: &[u8], base: &Model, work: &Model) -> Result<(Vec<
     let mut ct_xml = pkg.read("[Content_Types].xml")?;
     let mut rels_changed = false;
     let mut ct_changed = false;
+    // parts only the structural shift touched (other sheets, drawings, charts, ...)
+    for (part, x) in overlay {
+        replace.insert(part, x.into_bytes());
+    }
     if let Some(calc) = calc_rel {
         drop.insert(calc.target.clone());
         let id = calc.id.clone();
@@ -345,7 +414,8 @@ fn check_unsupported(base: &Model, work: &Model) -> Result<(), String> {
             why.push(format!("{n}: column widths/styles"));
         }
         if bs.rows != ws.rows {
-            why.push(format!("{n}: row heights/styles"));
+            let r = bs.rows.iter().zip(&ws.rows).find(|(a, b)| a != b).map(|(a, _)| a.r).or(bs.rows.last().map(|x| x.r));
+            why.push(format!("{n}: row heights/styles (row {})", r.unwrap_or(0)));
         }
         if bs.frozen_rows != ws.frozen_rows || bs.frozen_columns != ws.frozen_columns {
             why.push(format!("{n}: frozen panes"));
@@ -436,6 +506,21 @@ fn adopt_cell(t_cell: &str, styles: Option<&mut StyleTable>, strings: &mut Strin
     Ok(format!("{new_tag}{body}</c>"))
 }
 
+/// `ref` of a cell's `<f t="array">`.
+fn array_ref(cell: &str) -> Option<&str> {
+    let tk = tokens(cell).find(|t| t.local() == "f" && matches!(t.kind, Kind::Start | Kind::Empty))?;
+    let tag = &cell[tk.start..tk.end];
+    (attr(tag, "t") == Some("array")).then(|| attr(tag, "ref")).flatten()
+}
+
+/// Set the `ref` of a cell's `<f>`.
+fn set_array_ref(cell: &str, new_ref: &str) -> String {
+    match tokens(cell).find(|t| t.local() == "f" && matches!(t.kind, Kind::Start | Kind::Empty)) {
+        Some(tk) => format!("{}{}{}", &cell[..tk.start], set_attr(&cell[tk.start..tk.end], "ref", Some(new_ref)), &cell[tk.end..]),
+        None => cell.to_string(),
+    }
+}
+
 /// Keep the original cell (formula, attributes, extensions) and replace only its cached value.
 fn patch_value(orig: &str, t_cell: &str, strings: &mut StringTable, w_strings: &[String]) -> Result<String, String> {
     let (t, v) = value_of(t_cell, strings, w_strings)?;
@@ -476,6 +561,58 @@ mod tests {
         let none: Vec<String> = Vec::new();
         let out = patch_value(r#"<c r="B2" s="4" cm="1"><f t="shared" si="0"/><v>1</v></c>"#, r#"<c r="B2" s="9" t="str"><f>X</f><v>hi</v></c>"#, &mut st, &none).unwrap();
         assert_eq!(out, r#"<c r="B2" s="4" cm="1" t="str"><f t="shared" si="0"/><v>hi</v></c>"#);
+    }
+
+    #[test]
+    fn resized_array_takes_new_ref() {
+        let mut st = StringTable::parse(None);
+        let none: Vec<String> = Vec::new();
+        let orig = r#"<c r="F1" cm="1"><f t="array" ref="F1:F2">_xlfn._xlws.FILTER(A1:A7,A1:A7&gt;5)</f><v>8</v></c>"#;
+        let t = r#"<c r="F1" cm="1"><f t="array" ref="F1:F3">_xlfn._xlws.FILTER(A1:A7,A1:A7&gt;5)</f><v>9</v></c>"#;
+        assert_eq!(array_ref(t), Some("F1:F3"));
+        let out = set_array_ref(&patch_value(orig, t, &mut st, &none).unwrap(), array_ref(t).unwrap());
+        assert_eq!(out, r#"<c r="F1" cm="1"><f t="array" ref="F1:F3">_xlfn._xlws.FILTER(A1:A7,A1:A7&gt;5)</f><v>9</v></c>"#);
+    }
+
+    /// End to end: an edit that makes FILTER return more rows grows the anchor's ref, writes the
+    /// new spill cell as a plain value inside it, and the file reopens without #SPILL!.
+    #[test]
+    fn spill_range_follows_edit() {
+        let mut m = Model::new_empty("t", "en", "UTC", "en").unwrap();
+        for (r, v) in [(1, "5"), (2, "3"), (3, "8"), (4, "1")] {
+            m.set_user_input(0, r, 1, v.into()).unwrap();
+        }
+        m.set_user_input(0, 1, 6, "=FILTER(A1:A4,A1:A4>4)".into()).unwrap();
+        m.evaluate();
+        let orig = ironcalc::export::save_xlsx_to_writer(&m, Cursor::new(Vec::new())).unwrap().into_inner();
+        let load = |b: &[u8]| {
+            let wb = ironcalc::import::load_from_xlsx_bytes(b, "t", "en", "UTC").unwrap();
+            let mut m = Model::from_workbook(wb, "en").unwrap();
+            m.evaluate();
+            m
+        };
+        let base = load(&orig);
+        let mut work = load(&orig);
+        work.set_user_input(0, 2, 1, "7".into()).unwrap(); // A2: 3 -> 7, FILTER now 3 rows
+        work.evaluate();
+        let (out, _) = save_patched(&orig, &base, &work).unwrap();
+        let back = load(&out);
+        for r in 1..=3 {
+            assert_eq!(back.get_formatted_cell_value(0, r, 6).unwrap(), work.get_formatted_cell_value(0, r, 6).unwrap(), "F{r}");
+        }
+        assert_eq!(back.get_formatted_cell_value(0, 3, 6).unwrap(), "8");
+
+        // and shrinking back drops the cell that left the spill
+        let mut work2 = load(&out);
+        work2.set_user_input(0, 2, 1, "3".into()).unwrap();
+        work2.set_user_input(0, 3, 1, "2".into()).unwrap(); // FILTER now 1 row
+        work2.evaluate();
+        let base2 = load(&out);
+        let (out2, _) = save_patched(&out, &base2, &work2).unwrap();
+        let back2 = load(&out2);
+        assert_eq!(back2.get_formatted_cell_value(0, 1, 6).unwrap(), "5");
+        assert_eq!(back2.get_formatted_cell_value(0, 2, 6).unwrap(), "");
+        assert_eq!(back2.get_formatted_cell_value(0, 3, 6).unwrap(), "");
     }
 
     #[test]

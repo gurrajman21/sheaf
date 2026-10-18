@@ -7,7 +7,9 @@
 pub mod inspect;
 pub mod package;
 pub mod patch;
+pub mod refs;
 pub mod sheet;
+pub mod structural;
 pub mod tables;
 pub mod xml;
 

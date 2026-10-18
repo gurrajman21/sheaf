@@ -106,6 +106,10 @@ def engine_stats(files: dict, eng: str, subset=None) -> dict:
             lost = []
         if e.get("openpyxl_reopen") is not None:
             add(s["reopen"], [int(e["openpyxl_reopen"] is True), 1])
+        rl = e.get("reload")
+        if rl and "formulas" in rl:
+            add(s["reload_cells"], [rl["formulas"] - rl["mismatched"], rl["formulas"]])
+            add(s["reload_files"], [int(rl["mismatched"] == 0), 1])
         v = e.get("visual") or {}
         if "similarity" in v:
             sims.append(v["similarity"])
@@ -175,6 +179,8 @@ def main():
     row("Defined names kept", lambda s: frac(s.get("defined_names", [0, 0])))
     row("Saved file re-opens in openpyxl", lambda s: frac(s.get("reopen", [0, 0])))
     row("No broken shared formulas introduced", lambda s: frac(s.get("integrity_ok", [0, 0])))
+    row("Re-opened file recalculates like the edited model (cells)", lambda s: frac(s.get("reload_cells", [0, 0])))
+    row("Re-opened file recalculates like the edited model (files)", lambda s: frac(s.get("reload_files", [0, 0])))
     row("Visual similarity (median)", lambda s: f"{s['visual_median']:.1%}" if s["visual_median"] is not None else "–")
     row("Time per file (median / p95)", lambda s: f"{s['wall_median'] / 1000:.2f}s / {s['wall_p95'] / 1000:.2f}s")
     w("\n_Timing is wall-clock per file including process start-up (LibreOffice also includes UNO round-trips)._\n")

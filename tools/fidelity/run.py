@@ -63,7 +63,8 @@ def run_ironcalc(src: Path, dst: Path, mode: str, edits: Path | None) -> dict:
     """IronCalc via the Rust runner: `native` = IronCalc's own writer, `patch` = patch-in-place."""
     if not RUNNER.exists():
         return {"ok": False, "error": "ooxml_runner not built: run `cargo build --release`", "crash": "no_start"}
-    cmd = [str(RUNNER), str(src), str(dst), "--mode", mode] + (["--edits", str(edits)] if edits else [])
+    cmd = [str(RUNNER), str(src), str(dst), "--mode", mode] + (["--edits", str(edits)] if edits else []) \
+        + (["--reload-check"] if mode == "patch" else [])
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=TIMEOUT["ironcalc"])
     except subprocess.TimeoutExpired:
@@ -217,7 +218,7 @@ def process(task: dict) -> dict:
     trust = meta.get("trust_cached", rec.get("origin") == "excel")
     rec["trust_cached"] = trust
 
-    script = compare.make_edits(orig) if task["edits"] and orig is not None else None
+    script = compare.make_edits(orig, task.get("insert_rows", False)) if task["edits"] and orig is not None else None
     edits_path = None
     if script:
         rec["edit_script"] = script
@@ -244,7 +245,7 @@ def process(task: dict) -> dict:
             res = lo().run(["roundtrip", str(src), str(dst), script["edits"] if script else None])
         else:
             res = run_ironcalc(src, dst, "patch" if eng == "ironcalc-patch" else "native", edits_path)
-        er = {k: res.get(k) for k in ("ok", "error", "crash", "stages", "version", "patch", "edit_errors")}
+        er = {k: res.get(k) for k in ("ok", "error", "crash", "stages", "version", "patch", "edit_errors", "reload")}
         er["wall_ms"] = round((time.perf_counter() - t) * 1000)
         values = res.get("values") or {}
         er["formula_cells_reported"] = len(values)
@@ -256,7 +257,7 @@ def process(task: dict) -> dict:
             try:
                 rt = ooxml.read_package(str(dst))
                 if orig is not None:
-                    er["fidelity"] = compare.compare_packages(orig, rt, exclude)
+                    er["fidelity"] = compare.compare_packages(orig, rt, exclude, compare.row_shifts(script))
                 if script:
                     er["edits"] = compare.check_edits(rt, script)
             except Exception as e:
@@ -317,6 +318,7 @@ def main():
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--visual", action="store_true", help="render PDFs with LibreOffice and pixel-diff")
     ap.add_argument("--edits", action="store_true", help="apply the same scripted edits through every engine")
+    ap.add_argument("--insert-rows", action="store_true", help="with --edits: start the script with a row insert")
     ap.add_argument("--out", default="")
     args = ap.parse_args()
 
@@ -327,9 +329,11 @@ def main():
     out_dir = Path(args.out) if args.out else ROOT / "results" / time.strftime("%Y%m%d-%H%M%S")
     out_dir.mkdir(parents=True, exist_ok=True)
     for t in tasks:
-        t.update(out_dir=str(out_dir), engines=engines, visual=args.visual, edits=args.edits)
+        t.update(out_dir=str(out_dir), engines=engines, visual=args.visual, edits=args.edits,
+                 insert_rows=args.insert_rows)
     (out_dir / "run.json").write_text(json.dumps({"engines": engines, "corpus": args.corpus, "files": len(tasks),
-                                                  "visual": args.visual, "edits": args.edits, "started": time.ctime()}, indent=2))
+                                                  "visual": args.visual, "edits": args.edits,
+                                                  "insert_rows": args.insert_rows, "started": time.ctime()}, indent=2))
     print(f"{len(tasks)} files x {engines} with {args.jobs} workers -> {out_dir}", flush=True)
 
     t0 = time.time()

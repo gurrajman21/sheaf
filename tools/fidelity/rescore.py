@@ -28,7 +28,8 @@ def rescore(args):
     for er in rec["engines"].values():
         if er.get("roundtrip") and "fidelity" in er:
             rt = ooxml.read_package(str(out_dir / er["roundtrip"]))
-            er["fidelity"] = compare.compare_packages(orig, rt, compare.edited_cells(script))
+            er["fidelity"] = compare.compare_packages(orig, rt, compare.edited_cells(script),
+                                                      compare.row_shifts(script))
             if script:
                 er["edits"] = compare.check_edits(rt, script)
     return rec

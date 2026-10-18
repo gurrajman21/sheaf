@@ -46,6 +46,7 @@ cd tools/fidelity
 .venv/bin/python run.py                                   # everything, all three engines
 .venv/bin/python run.py --corpus synthetic,real --visual  # + PDF pixel diff via LibreOffice
 .venv/bin/python run.py --edits --visual                  # same scripted edits through every engine
+.venv/bin/python run.py --edits --insert-rows --visual    # ... starting with a 2-row insert mid-data
 .venv/bin/python run.py --engines ironcalc-patch --jobs 8
 .venv/bin/python report.py ../../results/<run> [../../results/<other-run>]
 ```
@@ -66,6 +67,17 @@ cd tools/fidelity
   when there is one), and add a dependent formula and a new text cell. Checked: each edit
   landed (with a correct cached value for the formula), nothing else changed (edited cells
   are excluded from the fidelity comparison), and no shared formulas were orphaned.
+- **Row insert** (`--edits --insert-rows`): the script first inserts two rows in the middle of
+  the edited sheet's data (below the header and frozen rows, never splitting an array formula);
+  the cell edits after it are addressed post-insert. Fidelity is then scored against the
+  original with rows below the insertion point moved down, so every value, formula, style,
+  merge, row height and feature must have moved with its cell. The insert itself counts as
+  an edit: the new rows must exist and be empty.
+- **Reload check** (`ironcalc-patch`): the runner re-opens its saved file in IronCalc,
+  recalculates, and compares every formula's value with the edited model's. A reference the
+  patch writer shifted wrongly shows up here. Mismatches can also be IronCalc's own model
+  being wrong (it re-enters moved text cells as input, so a string like `=x` becomes a
+  formula; it doesn't move table ranges inside already-parsed structured references).
 - **Visual** (`--visual`): LibreOffice renders original and round-trip to PDF; first 5 pages pixel-diffed.
 
 ## Known biases
