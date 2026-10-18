@@ -20,3 +20,8 @@ results/
 tools/fidelity/.lo-profile/
 
 .DS_Store
+
+# App build output
+node_modules/
+apps/sheets/dist/
+apps/sheets/src-tauri/gen/

@@ -1,3 +1,3 @@
 [workspace]
 resolver = "2"
-members = ["crates/ooxml"]
+members = ["crates/ooxml", "crates/sheets-core", "apps/sheets/src-tauri"]

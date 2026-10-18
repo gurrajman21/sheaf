@@ -4,6 +4,7 @@
 //! IronCalc model back into the original .xlsx so everything IronCalc doesn't
 //! model (charts, pivots, comments, validation, macros, ...) survives.
 
+pub mod inspect;
 pub mod package;
 pub mod patch;
 pub mod sheet;

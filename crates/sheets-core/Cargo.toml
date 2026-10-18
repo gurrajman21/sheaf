@@ -1,0 +1,13 @@
+[package]
+name = "sheets-core"
+version = "0.1.0"
+edition = "2021"
+description = "Backend of the spreadsheet app: workbook session, UI commands, patch-in-place save"
+
+[dependencies]
+ironcalc = "0.9.0"
+ironcalc_base = "0.9.0"
+ooxml = { path = "../ooxml" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tiny_http = "0.12"
