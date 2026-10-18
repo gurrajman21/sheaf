@@ -14,24 +14,50 @@
       {
         "label": "main",
         "title": "Sheaf",
-        "width": 1280,
-        "height": 820,
+        "width": 1360,
+        "height": 860,
         "minWidth": 720,
         "minHeight": 480,
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
-        "dragDropEnabled": true
+        "dragDropEnabled": true,
+        "transparent": true,
+        "windowEffects": {
+          "effects": [
+            "underWindowBackground"
+          ],
+          "state": "followsWindowActiveState"
+        }
       }
     ],
-    "security": { "csp": "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'" }
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'"
+    },
+    "macOSPrivateApi": true
   },
   "bundle": {
     "active": true,
-    "targets": ["app", "dmg"],
+    "targets": [
+      "app",
+      "dmg"
+    ],
     "category": "Productivity",
     "fileAssociations": [
-      { "ext": ["xlsx", "xlsm"], "name": "Excel Workbook", "role": "Editor" }
+      {
+        "ext": [
+          "xlsx",
+          "xlsm"
+        ],
+        "name": "Excel Workbook",
+        "role": "Editor"
+      }
     ],
-    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"]
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
   }
 }

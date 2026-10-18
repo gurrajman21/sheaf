@@ -18,14 +18,19 @@ use crate::refs::{self, Axis, Body, Shift};
 use crate::sheet::{cell_ref, parse_ref};
 use crate::xml::{self, attr, set_attr, tokens, Kind, Tok};
 
-/// A structural edit, as applied to the IronCalc model. Sheets are model indices.
-#[derive(Debug, Clone, Deserialize)]
+/// A structural edit, as applied to the IronCalc model. Sheets are model indices
+/// at the time of the op (earlier ops in the log may have added or removed sheets).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum StructuralOp {
     InsertRows { sheet: u32, at: i32, count: i32 },
     DeleteRows { sheet: u32, at: i32, count: i32 },
     InsertCols { sheet: u32, at: i32, count: i32 },
     DeleteCols { sheet: u32, at: i32, count: i32 },
+    /// A new, empty sheet appended after the last one.
+    AddSheet { name: String },
+    RenameSheet { sheet: u32, name: String },
+    DeleteSheet { sheet: u32 },
 }
 
 impl StructuralOp {
@@ -34,6 +39,20 @@ impl StructuralOp {
     /// the package uses, so the model and the saved file agree. Once IronCalc has moved
     /// the cells this never fails, so the model and the op log can't drift apart.
     pub fn apply(&self, model: &mut Model) -> Result<(), String> {
+        match self {
+            // IronCalc renames references in formulas and defined names itself; references
+            // to a deleted sheet stay as text in the model and evaluate to #REF!
+            StructuralOp::AddSheet { name } => return model.add_sheet(name),
+            StructuralOp::RenameSheet { sheet, name } => return model.rename_sheet_by_index(*sheet, name),
+            StructuralOp::DeleteSheet { sheet } => {
+                // names scoped to the sheet go with it, as in Excel (IronCalc would keep them
+                // pointing at a missing sheet, and its exporter can't write those)
+                let id = model.workbook.worksheet(*sheet)?.sheet_id;
+                model.workbook.defined_names.retain(|d| d.sheet_id != Some(id));
+                return model.delete_sheet(*sheet);
+            }
+            _ => {}
+        }
         let name = model.workbook.worksheet(self.sheet())?.name.clone();
         // IronCalc can fail halfway (cells moved, merges taken out); put the model back
         let backup = model.workbook.clone();
@@ -42,6 +61,7 @@ impl StructuralOp {
             StructuralOp::DeleteRows { sheet, at, count } => model.delete_rows(sheet, at, count),
             StructuralOp::InsertCols { sheet, at, count } => model.insert_columns(sheet, at, count),
             StructuralOp::DeleteCols { sheet, at, count } => model.delete_columns(sheet, at, count),
+            _ => unreachable!("sheet ops handled above"),
         };
         if let Err(e) = res {
             *model = Model::from_workbook(backup, "en")?;
@@ -74,21 +94,32 @@ impl StructuralOp {
         Ok(())
     }
 
+    /// The sheet the op edits (for `AddSheet`, the index the new sheet gets is not known here: `u32::MAX`).
     pub fn sheet(&self) -> u32 {
         match *self {
             StructuralOp::InsertRows { sheet, .. }
             | StructuralOp::DeleteRows { sheet, .. }
             | StructuralOp::InsertCols { sheet, .. }
-            | StructuralOp::DeleteCols { sheet, .. } => sheet,
+            | StructuralOp::DeleteCols { sheet, .. }
+            | StructuralOp::RenameSheet { sheet, .. }
+            | StructuralOp::DeleteSheet { sheet } => sheet,
+            StructuralOp::AddSheet { .. } => u32::MAX,
         }
     }
 
+    /// Row/column insert or delete (as opposed to a sheet op).
+    pub fn is_shift(&self) -> bool {
+        matches!(self, StructuralOp::InsertRows { .. } | StructuralOp::DeleteRows { .. } | StructuralOp::InsertCols { .. } | StructuralOp::DeleteCols { .. })
+    }
+
+    /// The reference shift of a row/column op. Panics on sheet ops (check `is_shift`).
     pub fn to_shift(&self, sheet_name: &str) -> Shift {
         let (axis, at, count) = match *self {
             StructuralOp::InsertRows { at, count, .. } => (Axis::Row, at, count),
             StructuralOp::DeleteRows { at, count, .. } => (Axis::Row, at, -count),
             StructuralOp::InsertCols { at, count, .. } => (Axis::Col, at, count),
             StructuralOp::DeleteCols { at, count, .. } => (Axis::Col, at, -count),
+            _ => panic!("to_shift on a sheet op"),
         };
         Shift { sheet: sheet_name.to_string(), axis, at, count }
     }
@@ -98,22 +129,22 @@ impl StructuralOp {
 
 /// Byte-range replacements over a source string. A replacement that covers
 /// earlier ones (removing a whole container) supersedes them.
-struct Splice<'a> {
+pub(crate) struct Splice<'a> {
     src: &'a str,
     reps: Vec<(usize, usize, String)>,
 }
 
 impl<'a> Splice<'a> {
-    fn new(src: &'a str) -> Self {
+    pub(crate) fn new(src: &'a str) -> Self {
         Splice { src, reps: Vec::new() }
     }
 
-    fn rep(&mut self, s: usize, e: usize, text: String) {
+    pub(crate) fn rep(&mut self, s: usize, e: usize, text: String) {
         self.reps.retain(|&(a, b, _)| !(a >= s && b <= e));
         self.reps.push((s, e, text));
     }
 
-    fn finish(mut self) -> Option<String> {
+    pub(crate) fn finish(mut self) -> Option<String> {
         if self.reps.is_empty() {
             return None;
         }
@@ -130,12 +161,12 @@ impl<'a> Splice<'a> {
     }
 }
 
-fn is_open(t: &Tok) -> bool {
+pub(crate) fn is_open(t: &Tok) -> bool {
     matches!(t.kind, Kind::Start | Kind::Empty)
 }
 
 /// Text span of a simple element (`<f>text</f>`): between its start tag and its end tag.
-fn text_span(toks: &[Tok], i: usize) -> Option<(usize, usize)> {
+pub(crate) fn text_span(toks: &[Tok], i: usize) -> Option<(usize, usize)> {
     if toks[i].kind != Kind::Start {
         return None;
     }
@@ -906,7 +937,7 @@ pub fn shift_package(
     }
 
     for (name, part) in sheets {
-        if !pkg.has(part) {
+        if !pkg.has(part) && !overlay.contains_key(part) {
             continue;
         }
         let src = get(pkg, overlay, part)?;

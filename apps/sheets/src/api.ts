@@ -54,6 +54,10 @@ export interface CellView {
   valign: "top" | "middle" | "bottom";
   wrap?: boolean;
   borders?: [boolean, boolean, boolean, boolean]; // top right bottom left
+  bar?: { value: number; axis: number; gradient: boolean; color: string; neg: string };
+  icon?: { name: string; color: string; count?: number; max?: number };
+  comment?: string;
+  formula?: boolean;
 }
 
 export interface CellStyle {
@@ -64,6 +68,7 @@ export interface CellStyle {
   num_fmt: string;
   size: number;
   align: string;
+  valign: string;
   wrap: boolean;
 }
 
@@ -75,6 +80,8 @@ export interface SaveResult {
   path?: string;
 }
 
-export interface Stats { sum: number; count: number; numbers: number; average: number | null }
+export interface Stats { sum: number; count: number; numbers: number; average: number | null; min: number | null; max: number | null }
+
+export interface FindHit { sheet: number; row: number; col: number; text: string }
 
 export interface Rect { sheet: number; row: number; col: number; width: number; height: number }

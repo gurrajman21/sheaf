@@ -164,11 +164,25 @@ pub enum CellEdit {
 
 /// Rebuild the sheet with `edits` applied. Rows without edits are copied verbatim.
 pub fn splice(sheet: &SheetXml, edits: &BTreeMap<(i32, i32), CellEdit>, new_dimension: Option<&str>) -> String {
+    splice_with_rows(sheet, edits, new_dimension, &BTreeMap::new())
+}
+
+/// Like [`splice`], also replacing the start tags of rows in `row_tags` (row
+/// height/visibility changes); rows that don't exist yet are created empty.
+pub fn splice_with_rows(
+    sheet: &SheetXml,
+    edits: &BTreeMap<(i32, i32), CellEdit>,
+    new_dimension: Option<&str>,
+    row_tags: &BTreeMap<i32, String>,
+) -> String {
     let src = sheet.src;
     let p = sheet.prefix.as_deref().map(|p| format!("{p}:")).unwrap_or_default();
     let mut by_row: BTreeMap<i32, Vec<(i32, &CellEdit)>> = BTreeMap::new();
     for ((r, c), e) in edits {
         by_row.entry(*r).or_default().push((*c, e));
+    }
+    for r in row_tags.keys() {
+        by_row.entry(*r).or_default();
     }
 
     let mut body = String::with_capacity(sheet.sheet_data.2 - sheet.sheet_data.1 + 1024);
@@ -186,7 +200,7 @@ pub fn splice(sheet: &SheetXml, edits: &BTreeMap<(i32, i32), CellEdit>, new_dime
             (o, Some(e)) => {
                 let row = if o == Some(e) { orig_rows.next() } else { None };
                 let (_, cell_edits) = pending.next().unwrap();
-                body.push_str(&rebuild_row(row, e, &cell_edits, &p));
+                body.push_str(&rebuild_row(row, e, &cell_edits, &p, row_tags.get(&e).map(String::as_str)));
             }
             _ => unreachable!(),
         }
@@ -214,7 +228,7 @@ pub fn splice(sheet: &SheetXml, edits: &BTreeMap<(i32, i32), CellEdit>, new_dime
     out
 }
 
-fn rebuild_row(row: Option<&RowXml>, r: i32, edits: &[(i32, &CellEdit)], p: &str) -> String {
+fn rebuild_row(row: Option<&RowXml>, r: i32, edits: &[(i32, &CellEdit)], p: &str, tag: Option<&str>) -> String {
     let mut cells: BTreeMap<i32, String> = BTreeMap::new();
     if let Some(row) = row {
         for c in &row.cells {
@@ -232,15 +246,16 @@ fn rebuild_row(row: Option<&RowXml>, r: i32, edits: &[(i32, &CellEdit)], p: &str
         }
     }
     // `spans` is an optional hint that may now be wrong; drop it.
-    let start = match row {
-        Some(row) => {
+    let start = match (tag, row) {
+        (Some(t), _) => set_attr(&set_attr(t, "spans", None), "r", Some(&r.to_string())).replacen("/>", ">", 1),
+        (None, Some(row)) => {
             let t = set_attr(&row.start_tag, "spans", None);
             let t = set_attr(&t, "r", Some(&r.to_string()));
             t.replacen("/>", ">", 1)
         }
-        None => format!("<{p}row r=\"{r}\">"),
+        (None, None) => format!("<{p}row r=\"{r}\">"),
     };
-    if cells.is_empty() && row.is_none() {
+    if cells.is_empty() && row.is_none() && tag.is_none() {
         return String::new();
     }
     let mut out = start;

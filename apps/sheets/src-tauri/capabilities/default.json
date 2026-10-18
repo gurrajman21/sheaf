@@ -2,13 +2,18 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "What the Sheaf window may do",
-  "windows": ["main"],
+  "windows": [
+    "main"
+  ],
   "permissions": [
     "core:default",
     "core:window:allow-set-title",
     "core:window:allow-start-dragging",
     "core:window:allow-destroy",
     "dialog:default",
-    "clipboard-manager:allow-write-text"
+    "clipboard-manager:allow-write-text",
+    "clipboard-manager:allow-read-text",
+    "core:menu:default",
+    "core:event:default"
   ]
 }

@@ -10,6 +10,7 @@ export interface Cell { r: number; c: number }
 export interface Selection { anchor: Cell; focus: Cell }
 
 export interface Geometry {
+  zoom: number;
   layout: Layout;
   rowY: Float64Array; // rowY[r-1] = top of row r; rowY[rows] = total height
   colX: Float64Array;
@@ -17,12 +18,19 @@ export interface Geometry {
   frozenW: number;
 }
 
-export function makeGeometry(layout: Layout): Geometry {
+/** `zoom` scales cells (not headers); `layout` keeps the file's sizes, `zoomed` the drawn ones. */
+export function makeGeometry(file: Layout, zoom = 1): Geometry {
+  const layout: Layout = zoom === 1 ? file : {
+    ...file,
+    row_heights: file.row_heights.map((h) => h * zoom),
+    col_widths: file.col_widths.map((w) => w * zoom),
+  };
   const rowY = new Float64Array(layout.rows + 1);
   for (let i = 0; i < layout.rows; i++) rowY[i + 1] = rowY[i] + layout.row_heights[i];
   const colX = new Float64Array(layout.cols + 1);
   for (let i = 0; i < layout.cols; i++) colX[i + 1] = colX[i] + layout.col_widths[i];
   return {
+    zoom,
     layout,
     rowY,
     colX,

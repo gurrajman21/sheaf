@@ -509,9 +509,297 @@ pub fn shift_sqref(list: &str, s: &Shift) -> Option<Option<String>> {
     Some((!parts.is_empty()).then(|| parts.join(" ")))
 }
 
+// ----------------------------------------------------------------------------- sheet names
+
+/// A sheet prefix in formula text: `Data!`, `'My Sheet'!`, 3D `S1:S3!`, external `[1]Data!`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Prefix {
+    /// Byte range of the prefix, `!` included.
+    pub span: (usize, usize),
+    /// Unquoted sheet names: one, or two for a 3D span.
+    pub sheets: Vec<String>,
+    pub external: bool,
+    pub quoted: bool,
+    /// End of what the prefix qualifies (a reference, a name or an error like `#REF!`).
+    pub ref_end: usize,
+}
+
+/// Every sheet prefix in formula text, skipping string literals and structured references.
+pub fn sheet_prefixes(f: &str) -> Vec<Prefix> {
+    let b = f.as_bytes();
+    let ch = |i: usize| f[i..].chars().next().unwrap();
+    let ident_end = |mut i: usize| {
+        while i < b.len() && is_ident(ch(i)) {
+            i += ch(i).len_utf8();
+        }
+        i
+    };
+    // what follows `!`: an error literal, or a word with an optional `:word` (range)
+    let target_end = |i: usize| -> usize {
+        if b.get(i) == Some(&b'#') {
+            let mut j = i + 1;
+            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'/') {
+                j += 1;
+            }
+            if j < b.len() && (b[j] == b'!' || b[j] == b'?') {
+                j += 1;
+            }
+            return j;
+        }
+        let e = ident_end(i);
+        if b.get(e) == Some(&b':') {
+            let e2 = ident_end(e + 1);
+            if e2 > e + 1 && parse_body(&f[i..e2]).is_some() {
+                return e2;
+            }
+        }
+        e
+    };
+    // a quoted name ('' escapes): (name, offset past the closing quote)
+    let quoted_at = |i: usize| -> Option<(String, usize)> {
+        let mut j = i + 1;
+        let mut name = String::new();
+        while j < b.len() {
+            if b[j] == b'\'' {
+                if b.get(j + 1) == Some(&b'\'') {
+                    name.push('\'');
+                    j += 2;
+                    continue;
+                }
+                return Some((name, j + 1));
+            }
+            name.push(ch(j));
+            j += ch(j).len_utf8();
+        }
+        None
+    };
+    let name_at = |i: usize| -> Option<(String, usize)> {
+        match b.get(i) {
+            Some(b'\'') => quoted_at(i),
+            Some(_) if is_ident(ch(i)) => Some((f[i..ident_end(i)].to_string(), ident_end(i))),
+            _ => None,
+        }
+    };
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'"' => {
+                i += 1;
+                while i < b.len() {
+                    if b[i] == b'"' {
+                        if b.get(i + 1) == Some(&b'"') {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'\'' => {
+                let start = i;
+                let Some((name, e)) = quoted_at(i) else { break };
+                let second = (b.get(e) == Some(&b':')).then(|| name_at(e + 1)).flatten();
+                match (b.get(e), second) {
+                    (Some(b'!'), _) => {
+                        let external = name.starts_with('[');
+                        let sheets = if external { vec![name] } else { name.split(':').map(str::to_string).collect() };
+                        out.push(Prefix { span: (start, e + 1), sheets, external, quoted: true, ref_end: target_end(e + 1) });
+                        i = target_end(e + 1);
+                    }
+                    // 'First':'Last'! (LibreOffice writes 3D spans this way)
+                    (_, Some((n2, e2))) if b.get(e2) == Some(&b'!') => {
+                        out.push(Prefix { span: (start, e2 + 1), sheets: vec![name, n2], external: false, quoted: true, ref_end: target_end(e2 + 1) });
+                        i = target_end(e2 + 1);
+                    }
+                    _ => i = e,
+                }
+            }
+            b'#' => {
+                let mut j = i + 1;
+                while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'/') {
+                    j += 1;
+                }
+                if j < b.len() && (b[j] == b'!' || b[j] == b'?') {
+                    j += 1;
+                }
+                i = j;
+            }
+            b'[' => {
+                let start = i;
+                let mut depth = 0;
+                let mut j = i;
+                while j < b.len() {
+                    match b[j] {
+                        b'[' => depth += 1,
+                        b']' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        b'\'' => j += 1,
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                let ext = i == 0 || !is_ident(f[..i].chars().next_back().unwrap_or(' '));
+                i = j + 1;
+                if ext {
+                    let e = ident_end(i.min(b.len()));
+                    if b.get(e) == Some(&b'!') {
+                        out.push(Prefix { span: (start, e + 1), sheets: vec![f[start..e].to_string()], external: true, quoted: false, ref_end: target_end(e + 1) });
+                        i = target_end(e + 1);
+                    }
+                }
+            }
+            c if c.is_ascii_digit() => {
+                // numbers and row ranges never carry a prefix; skip the whole token
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'.' || b[i] == b':' || b[i] == b'$') {
+                    i += 1;
+                }
+            }
+            _ if is_ident(ch(i)) => {
+                let start = i;
+                let e = ident_end(i);
+                if b.get(e) == Some(&b'!') {
+                    out.push(Prefix { span: (start, e + 1), sheets: vec![f[start..e].to_string()], external: false, quoted: false, ref_end: target_end(e + 1) });
+                    i = target_end(e + 1);
+                    continue;
+                }
+                if b.get(e) == Some(&b':') {
+                    if let Some((n2, e2)) = name_at(e + 1) {
+                        if b.get(e2) == Some(&b'!') && parse_body(&f[start..e2]).is_none() {
+                            let quoted = b[e + 1] == b'\'';
+                            out.push(Prefix { span: (start, e2 + 1), sheets: vec![f[start..e].to_string(), n2], external: false, quoted, ref_end: target_end(e2 + 1) });
+                            i = target_end(e2 + 1);
+                            continue;
+                        }
+                    }
+                }
+                i = e;
+            }
+            _ => i += ch(i).len_utf8(),
+        }
+    }
+    out
+}
+
+/// Whether a sheet name must be quoted in a formula (`'My Sheet'!A1`).
+pub fn needs_quotes(name: &str) -> bool {
+    let first = name.chars().next();
+    if first.is_none_or(|c| c.is_ascii_digit() || c == '.') {
+        return true;
+    }
+    if !name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.') {
+        return true;
+    }
+    // names that read as references or booleans
+    let up = name.to_ascii_uppercase();
+    let rc = {
+        let s = up.strip_prefix('R').map(|r| r.trim_start_matches(|c: char| c.is_ascii_digit())).unwrap_or(&up);
+        let s = s.strip_prefix('C').map(|r| r.trim_start_matches(|c: char| c.is_ascii_digit())).unwrap_or(s);
+        s.is_empty()
+    };
+    rc || parse_cell(name).is_some() || up == "TRUE" || up == "FALSE"
+}
+
+/// A sheet name (or `A:B` 3D span) as written before `!`.
+pub fn fmt_sheet(sheets: &[String], force_quotes: bool) -> String {
+    let joined = sheets.join(":");
+    if force_quotes || sheets.iter().any(|s| needs_quotes(s)) {
+        format!("'{}'", joined.replace('\'', "''"))
+    } else {
+        joined
+    }
+}
+
+fn same_sheet(a: &str, b: &str) -> bool {
+    a.to_lowercase() == b.to_lowercase()
+}
+
+/// Rewrite references to sheet `old` as references to `new`. `None` if nothing changed.
+pub fn rename_sheet_in_formula(f: &str, old: &str, new: &str) -> Option<String> {
+    let mut out = String::with_capacity(f.len() + 8);
+    let mut cursor = 0;
+    for p in sheet_prefixes(f) {
+        if p.external || !p.sheets.iter().any(|s| same_sheet(s, old)) {
+            continue;
+        }
+        let sheets: Vec<String> = p.sheets.iter().map(|s| if same_sheet(s, old) { new.to_string() } else { s.clone() }).collect();
+        out.push_str(&f[cursor..p.span.0]);
+        out.push_str(&fmt_sheet(&sheets, p.quoted));
+        out.push('!');
+        cursor = p.span.1;
+    }
+    if cursor == 0 {
+        return None;
+    }
+    out.push_str(&f[cursor..]);
+    Some(out)
+}
+
+/// Turn references to the deleted sheet into `#REF!`, as Excel does. A 3D span that
+/// ends on the deleted sheet would need the sheet order to shrink it: refused.
+pub fn delete_sheet_in_formula(f: &str, deleted: &str) -> Result<Option<String>, String> {
+    let mut out = String::with_capacity(f.len());
+    let mut cursor = 0;
+    for p in sheet_prefixes(f) {
+        if p.external || !p.sheets.iter().any(|s| same_sheet(s, deleted)) {
+            continue;
+        }
+        if p.sheets.len() > 1 {
+            return Err(format!("3D reference ending on deleted sheet {deleted}"));
+        }
+        out.push_str(&f[cursor..p.span.0]);
+        out.push_str("#REF!");
+        cursor = p.ref_end;
+    }
+    if cursor == 0 {
+        return Ok(None);
+    }
+    out.push_str(&f[cursor..]);
+    Ok(Some(out))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rename_sheets() {
+        let r = |f: &str| rename_sheet_in_formula(f, "Data", "Q1 Data").unwrap_or_else(|| f.to_string());
+        assert_eq!(r("Data!A1+data!$B$2:$C$3+A1"), "'Q1 Data'!A1+'Q1 Data'!$B$2:$C$3+A1");
+        assert_eq!(r("SUM('Data'!A:A)&\"Data!A1\""), "SUM('Q1 Data'!A:A)&\"Data!A1\"");
+        assert_eq!(r("Other!A1+[1]Data!A1+'[2]Data'!A1+Tbl[Data]"), "Other!A1+[1]Data!A1+'[2]Data'!A1+Tbl[Data]");
+        assert_eq!(r("SUM(Data:Other!A1)+Data!#REF!+Data!Rate"), "SUM('Q1 Data:Other'!A1)+'Q1 Data'!#REF!+'Q1 Data'!Rate");
+        assert_eq!(rename_sheet_in_formula("'My ''Q'''!A1", "My 'Q'", "Plain"), Some("'Plain'!A1".into()), "quoting kept");
+        assert_eq!(rename_sheet_in_formula("Data!A1", "Data", "Sales"), Some("Sales!A1".into()));
+        assert_eq!(rename_sheet_in_formula("SUM('a b':'Data'!B1:B2)", "Data", "X"), Some("SUM('a b:X'!B1:B2)".into()));
+        assert_eq!(rename_sheet_in_formula("Data!A1", "Data", "A1"), Some("'A1'!A1".into()));
+        assert_eq!(rename_sheet_in_formula("Datas!A1+1.5E+3", "Data", "X"), None);
+    }
+
+    #[test]
+    fn delete_sheets() {
+        let d = |f: &str| delete_sheet_in_formula(f, "Data").unwrap().unwrap_or_else(|| f.to_string());
+        assert_eq!(d("SUM(Data!A1:B2)+'Data'!C3*2+Other!A1"), "SUM(#REF!)+#REF!*2+Other!A1");
+        assert_eq!(d("Data!$1:$2"), "#REF!");
+        assert_eq!(d("Data!#REF!+Data!Rate"), "#REF!+#REF!");
+        assert!(delete_sheet_in_formula("SUM(Data:Other!A1)", "Data").is_err());
+        assert!(delete_sheet_in_formula("SUM('Data':'Other 2'!A1)", "Other 2").is_err());
+        assert!(delete_sheet_in_formula("SUM(Data:'Other 2'!A1)", "Other 2").is_err());
+        assert_eq!(delete_sheet_in_formula("'It''s'!A1&\"x\"", "It's").unwrap(), Some("#REF!&\"x\"".into()));
+    }
+
+    #[test]
+    fn quoting() {
+        for (n, q) in [("Sheet1", false), ("My Sheet", true), ("1st", true), ("A1", true), ("R1C1", true), ("Résumé", false), ("a-b", true), ("TRUE", true), ("Q1", true), ("Q1_", false)] {
+            assert_eq!(needs_quotes(n), q, "{n}");
+        }
+    }
 
     fn rows(at: i32, count: i32) -> Shift {
         Shift { sheet: "Data".into(), axis: Axis::Row, at, count }

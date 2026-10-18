@@ -15,16 +15,18 @@
 //!    dropped when any cell changed (Excel rebuilds it).
 //! 4. Every other part is raw-copied from the original zip.
 //!
-//! Row/column inserts and deletes come in as an explicit operation log
-//! ([`StructuralOp`]): the same ops are replayed on a copy of the baseline
-//! model (so the cell diff above compares like with like) and on the original
-//! XML, where every reference to the edited sheet is shifted (see `structural`).
+//! Row/column inserts and deletes and sheet add/rename/delete come in as an
+//! explicit operation log ([`StructuralOp`]): the same ops are replayed on a
+//! copy of the baseline model (so the cell diff above compares like with like)
+//! and on the original XML, where every reference to the edited sheet is
+//! shifted or renamed (see `structural` and `sheetops`). A new sheet starts as
+//! an empty part and gets its cells from the diff like any other sheet.
 //!
-//! Anything the edits changed that this writer can't express yet (merges,
-//! column widths, sheet add/rename, ...) is refused with an error rather than
+//! Anything the edits changed that this writer can't express yet (sheet
+//! visibility, defined-name edits, ...) is refused with an error rather than
 //! silently lost.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Cursor;
 
 use ironcalc_base::types::Cell;
@@ -33,6 +35,7 @@ use serde::Serialize;
 
 use crate::package::{append_to_root, remove_elements, resolve, Package};
 use crate::sheet::{self, CellEdit};
+use crate::sheetops::{self, PkgEdits, SheetPart};
 pub use crate::structural::StructuralOp;
 use crate::tables::{StringTable, StyleTable};
 use crate::xml::{self, attr, set_attr, tokens, Kind, Tok};
@@ -140,35 +143,60 @@ pub fn save_patched_ops(
     let wb_rels = pkg.rels(&wb_path)?;
     let wb_xml = pkg.read(&wb_path)?;
     let by_id: HashMap<&str, _> = wb_rels.iter().map(|r| (r.id.as_str(), r)).collect();
-    let mut sheet_parts = Vec::new();
+    let mut sheet_parts: Vec<SheetPart> = Vec::new();
     for t in tokens(&wb_xml).filter(|t| t.local() == "sheet" && matches!(t.kind, Kind::Empty | Kind::Start)) {
         let tag = &wb_xml[t.start..t.end];
         let rid = xml::attrs(tag).into_iter().find(|(k, _)| k.ends_with(":id")).map(|(_, v)| v);
         if let Some(rel) = rid.and_then(|id| by_id.get(id)) {
             if rel.kind.ends_with("/worksheet") {
-                sheet_parts.push((xml::unescape(attr(tag, "name").unwrap_or("")), rel.target.clone()));
+                let name = xml::unescape(attr(tag, "name").unwrap_or(""));
+                sheet_parts.push(SheetPart { name, part: rel.target.clone(), rid: rel.id.clone() });
             }
         }
     }
-    let worksheets = &work.workbook.worksheets;
-    if sheet_parts.len() != worksheets.len()
-        || sheet_parts.iter().zip(worksheets).any(|((n, _), w)| *n != w.name)
-    {
-        return Err(format!(
-            "sheet mapping mismatch: file {:?} vs model {:?}",
-            sheet_parts.iter().map(|(n, _)| n).collect::<Vec<_>>(),
-            worksheets.iter().map(|w| &w.name).collect::<Vec<_>>()
-        ));
-    }
-    // ---- structural ops: shift the original package's references first
-    let mut overlay: BTreeMap<String, String> = BTreeMap::new();
+    // ---- structural ops, in order: shift references, add/rename/delete sheets
+    let mut ed = PkgEdits {
+        overlay: BTreeMap::new(),
+        added: BTreeSet::new(),
+        drop: HashSet::new(),
+        wb_path: wb_path.clone(),
+        wb_rels: pkg.read(&crate::package::rels_path(&wb_path))?,
+        ct: pkg.read("[Content_Types].xml")?,
+        rels_changed: false,
+        ct_changed: false,
+    };
     let mut remat: BTreeMap<String, HashSet<(i32, i32)>> = BTreeMap::new();
     for op in ops {
         let i = op.sheet() as usize;
-        let name = &base.workbook.worksheets.get(i).ok_or("structural op on a missing sheet")?.name;
-        crate::structural::shift_package(&mut pkg, &mut overlay, &wb_path, &sheet_parts, &op.to_shift(name), &mut remat)?;
+        match op {
+            StructuralOp::AddSheet { name } => sheetops::add_sheet(&mut pkg, &mut ed, &mut sheet_parts, name)?,
+            StructuralOp::RenameSheet { name, .. } => sheetops::rename_sheet(&mut pkg, &mut ed, &mut sheet_parts, i, name)?,
+            StructuralOp::DeleteSheet { .. } => {
+                let part = sheet_parts.get(i).ok_or("delete: no such sheet")?.part.clone();
+                sheetops::delete_sheet(&mut pkg, &mut ed, &mut sheet_parts, i)?;
+                remat.remove(&part);
+            }
+            _ => {
+                let name = sheet_parts.get(i).ok_or("structural op on a missing sheet")?.name.clone();
+                let list: Vec<(String, String)> = sheet_parts.iter().map(|s| (s.name.clone(), s.part.clone())).collect();
+                crate::structural::shift_package(&mut pkg, &mut ed.overlay, &wb_path, &list, &op.to_shift(&name), &mut remat)?;
+            }
+        }
     }
+    // a later shift may have re-read parts of a deleted sheet (its charts, say)
+    ed.overlay.retain(|p, _| !ed.drop.contains(p));
     report.structural_ops = ops.len();
+    let worksheets = &work.workbook.worksheets;
+    if sheet_parts.len() != worksheets.len()
+        || sheet_parts.iter().zip(worksheets).any(|(s, w)| s.name != w.name)
+    {
+        return Err(format!(
+            "sheet mapping mismatch: file {:?} vs model {:?}",
+            sheet_parts.iter().map(|s| &s.name).collect::<Vec<_>>(),
+            worksheets.iter().map(|w| &w.name).collect::<Vec<_>>()
+        ));
+    }
+    let mut overlay = std::mem::take(&mut ed.overlay);
     let sst_rel = wb_rels.iter().find(|r| r.kind.ends_with("/sharedStrings"));
     let styles_rel = wb_rels.iter().find(|r| r.kind.ends_with("/styles"));
     let calc_rel = wb_rels.iter().find(|r| r.kind.ends_with("/calcChain"));
@@ -201,7 +229,8 @@ pub fn save_patched_ops(
         }
         diffs.push(d);
     }
-    if diffs.iter().all(BTreeMap::is_empty) && ops.is_empty() {
+    let layouts: Vec<LayoutChanges> = (0..worksheets.len()).map(|i| layout_changes(base, work, i)).collect();
+    if diffs.iter().all(BTreeMap::is_empty) && ops.is_empty() && !layouts.iter().any(LayoutChanges::any) {
         // nothing changed: the original bytes are the best possible output
         return Ok((original.to_vec(), report));
     }
@@ -223,9 +252,10 @@ pub fn save_patched_ops(
 
     let mut replace: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     for (i, d) in diffs.iter().enumerate() {
-        let (_, part) = &sheet_parts[i];
+        let part = &sheet_parts[i].part;
         let forced = remat.remove(part).unwrap_or_default();
-        if d.is_empty() && forced.is_empty() {
+        let layout = &layouts[i];
+        if d.is_empty() && forced.is_empty() && !layout.any() && !overlay.contains_key(part) {
             continue;
         }
         let orig_xml = match overlay.remove(part) {
@@ -329,20 +359,60 @@ pub fn save_patched_ops(
         } else {
             None
         };
-        replace.insert(part.clone(), sheet::splice(&orig, &edits, dim.as_deref()).into_bytes());
+        // row heights/visibility/styles: copy only those attributes from IronCalc's row tag
+        let mut row_tags: BTreeMap<i32, String> = BTreeMap::new();
+        for &r in &layout.rows {
+            let orig_tag = orig.rows.iter().find(|x| x.r == r).map(|x| x.start_tag.clone()).unwrap_or_else(|| format!("<row r=\"{r}\">"));
+            let t_tag = t_sheet.rows.iter().find(|x| x.r == r).map(|x| x.start_tag.as_str());
+            let mut tag = orig_tag;
+            for key in ["ht", "customHeight", "hidden", "customFormat", "s"] {
+                let mut v = t_tag.and_then(|t| attr(t, key)).map(str::to_string);
+                if key == "s" {
+                    if let Some(sv) = v.as_ref().and_then(|x| x.parse::<i32>().ok()) {
+                        v = match styles.as_mut() {
+                            Some(st) => Some(st.map_xf(sv)?.to_string()),
+                            None => None,
+                        };
+                    }
+                }
+                tag = set_attr(&tag, key, v.as_deref());
+            }
+            row_tags.insert(r, tag);
+        }
+        let mut out = sheet::splice_with_rows(&orig, &edits, dim.as_deref(), &row_tags);
+        if layout.merges {
+            out = replace_child(&out, "mergeCells", child_xml(&t_xml, "mergeCells").as_deref(), AFTER_MERGE_CELLS);
+        }
+        if layout.cols {
+            let cols = match child_xml(&t_xml, "cols") {
+                Some(c) => Some(remap_style_attrs(&c, "style", styles.as_mut())?),
+                None => None,
+            };
+            out = replace_child(&out, "cols", cols.as_deref(), AFTER_COLS);
+        }
+        if layout.view {
+            out = replace_child(&out, "sheetViews", child_xml(&t_xml, "sheetViews").as_deref(), AFTER_SHEET_VIEWS);
+        }
+        replace.insert(part.clone(), out.into_bytes());
         report.sheets_rewritten += 1;
     }
 
     // ---- package-level fixes
-    let mut drop = HashSet::new();
+    let mut drop = std::mem::take(&mut ed.drop);
     let mut add = BTreeMap::new();
-    let mut wb_rels_xml = pkg.read(&crate::package::rels_path(&wb_path))?;
-    let mut ct_xml = pkg.read("[Content_Types].xml")?;
-    let mut rels_changed = false;
-    let mut ct_changed = false;
-    // parts only the structural shift touched (other sheets, drawings, charts, ...)
+    let mut wb_rels_xml = std::mem::take(&mut ed.wb_rels);
+    let mut ct_xml = std::mem::take(&mut ed.ct);
+    let mut rels_changed = ed.rels_changed;
+    let mut ct_changed = ed.ct_changed;
+    // parts only the structural ops touched (other sheets, drawings, charts, ...)
     for (part, x) in overlay {
         replace.insert(part, x.into_bytes());
+    }
+    // new sheets aren't in the original zip
+    for part in &ed.added {
+        if let Some(x) = replace.remove(part) {
+            add.insert(part.clone(), x);
+        }
     }
     if let Some(calc) = calc_rel {
         drop.insert(calc.target.clone());
@@ -395,6 +465,114 @@ pub fn save_patched_ops(
     Ok((bytes, report))
 }
 
+/// Sheet layout that differs between baseline and working model.
+#[derive(Default)]
+struct LayoutChanges {
+    merges: bool,
+    cols: bool,
+    view: bool,
+    rows: Vec<i32>,
+}
+
+impl LayoutChanges {
+    fn any(&self) -> bool {
+        self.merges || self.cols || self.view || !self.rows.is_empty()
+    }
+}
+
+fn layout_changes(base: &Model, work: &Model, sheet: usize) -> LayoutChanges {
+    let (b, w) = (&base.workbook.worksheets[sheet], &work.workbook.worksheets[sheet]);
+    let rows_of = |ws: &ironcalc_base::types::Worksheet| -> HashMap<i32, String> {
+        ws.rows.iter().map(|r| (r.r, format!("{r:?}"))).collect()
+    };
+    let (br, wr) = (rows_of(b), rows_of(w));
+    let mut rows: Vec<i32> = br.keys().chain(wr.keys()).copied().filter(|r| br.get(r) != wr.get(r)).collect();
+    rows.sort();
+    rows.dedup();
+    LayoutChanges {
+        merges: b.merged_cells != w.merged_cells,
+        cols: b.cols != w.cols,
+        view: b.frozen_rows != w.frozen_rows || b.frozen_columns != w.frozen_columns || b.show_grid_lines != w.show_grid_lines,
+        rows,
+    }
+}
+
+/// Worksheet children that come after each element we may insert (schema order).
+const AFTER_SHEET_VIEWS: &[&str] = &["sheetFormatPr", "cols", "sheetData"];
+const AFTER_COLS: &[&str] = &["sheetData"];
+const AFTER_MERGE_CELLS: &[&str] = &[
+    "phoneticPr", "conditionalFormatting", "dataValidations", "hyperlinks", "printOptions", "pageMargins",
+    "pageSetup", "headerFooter", "rowBreaks", "colBreaks", "customProperties", "cellWatches", "ignoredErrors",
+    "smartTags", "drawing", "legacyDrawing", "legacyDrawingHF", "drawingHF", "picture", "oleObjects", "controls",
+    "webPublishItems", "tableParts", "extLst",
+];
+
+/// Byte range of the root's direct child `name`, and where it would be inserted if absent.
+pub(crate) fn find_child(src: &str, name: &str, following: &[&str]) -> (Option<(usize, usize)>, usize) {
+    let toks: Vec<Tok> = tokens(src).collect();
+    let (mut depth, mut found, mut insert_at, mut root_close) = (0usize, None, None, src.len());
+    for (i, t) in toks.iter().enumerate() {
+        let at_child = depth == 1 && matches!(t.kind, Kind::Start | Kind::Empty);
+        if at_child {
+            if t.local() == name && found.is_none() {
+                found = Some((t.start, xml::element_end(&toks, i)));
+            } else if insert_at.is_none() && following.contains(&t.local()) {
+                insert_at = Some(t.start);
+            }
+        }
+        match t.kind {
+            Kind::Start => depth += 1,
+            Kind::End => {
+                depth -= 1;
+                if depth == 0 {
+                    root_close = t.start;
+                }
+            }
+            _ => {}
+        }
+    }
+    (found, insert_at.unwrap_or(root_close))
+}
+
+pub(crate) fn child_xml(src: &str, name: &str) -> Option<String> {
+    find_child(src, name, &[]).0.map(|(a, b)| src[a..b].to_string())
+}
+
+/// Replace, insert or remove the root's direct child `name`.
+pub(crate) fn replace_child(src: &str, name: &str, new: Option<&str>, following: &[&str]) -> String {
+    match (find_child(src, name, following), new) {
+        ((Some((a, b)), _), Some(n)) => format!("{}{n}{}", &src[..a], &src[b..]),
+        ((Some((a, b)), _), None) => format!("{}{}", &src[..a], &src[b..]),
+        ((None, at), Some(n)) => format!("{}{n}{}", &src[..at], &src[at..]),
+        ((None, _), None) => src.to_string(),
+    }
+}
+
+/// Remap `s`/`style` attributes in IronCalc-exported XML into the patched style table.
+fn remap_style_attrs(xml_src: &str, key: &str, styles: Option<&mut StyleTable>) -> Result<String, String> {
+    let mut out = String::with_capacity(xml_src.len());
+    let mut cursor = 0;
+    let mut styles = styles;
+    for t in tokens(xml_src) {
+        if !matches!(t.kind, Kind::Start | Kind::Empty) {
+            continue;
+        }
+        let tag = &xml_src[t.start..t.end];
+        if let Some(sv) = attr(tag, key).and_then(|v| v.parse::<i32>().ok()) {
+            let mapped = match styles.as_deref_mut() {
+                Some(st) => Some(st.map_xf(sv)?.to_string()),
+                None if sv == 0 => Some("0".into()),
+                None => None,
+            };
+            out.push_str(&xml_src[cursor..t.start]);
+            out.push_str(&set_attr(tag, key, mapped.as_deref()));
+            cursor = t.end;
+        }
+    }
+    out.push_str(&xml_src[cursor..]);
+    Ok(out)
+}
+
 /// Refuse edits this writer can't carry over yet, so nothing is lost silently.
 fn check_unsupported(base: &Model, work: &Model) -> Result<(), String> {
     let (b, w) = (&base.workbook, &work.workbook);
@@ -407,19 +585,8 @@ fn check_unsupported(base: &Model, work: &Model) -> Result<(), String> {
         if bs.name != ws.name {
             why.push(format!("sheet renamed ({} -> {})", bs.name, ws.name));
         }
-        if bs.merged_cells != ws.merged_cells {
-            why.push(format!("{n}: merged cells"));
-        }
-        if bs.cols != ws.cols {
-            why.push(format!("{n}: column widths/styles"));
-        }
-        if bs.rows != ws.rows {
-            let r = bs.rows.iter().zip(&ws.rows).find(|(a, b)| a != b).map(|(a, _)| a.r).or(bs.rows.last().map(|x| x.r));
-            why.push(format!("{n}: row heights/styles (row {})", r.unwrap_or(0)));
-        }
-        if bs.frozen_rows != ws.frozen_rows || bs.frozen_columns != ws.frozen_columns {
-            why.push(format!("{n}: frozen panes"));
-        }
+        // merges, column widths, row heights/visibility and frozen panes are carried
+        // over by `layout_changes`; sheet-level changes still aren't
         if bs.state != ws.state {
             why.push(format!("{n}: visibility"));
         }
