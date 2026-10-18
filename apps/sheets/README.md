@@ -44,10 +44,12 @@ cd apps/sheets && npx vite      # http://localhost:1420, proxies /api to :7878
 
 ## Known limits
 
-- **Structural edits** (insert/delete rows or columns, add/rename/delete sheets) can't
-  yet be patched into the original file. Saving after one asks before rewriting the
-  file, which drops charts, pivots etc. The `refs/heads/claude/goofy-mestorf-fd3d21`
-  branch adds row/column support to the patch writer; it isn't merged yet.
+- **Sheet changes** (add, rename, delete) can't yet be patched into the original
+  file. Saving after one asks before rewriting the file, which drops charts,
+  pivots etc. Row and column inserts/deletes *are* patched: references in
+  formulas, charts, conditional formatting, validation, merges, tables and names shift with them.
+- Undo or redo after a row/column/sheet change also makes the next save ask first,
+  because the change log may no longer match the sheet.
 - Charts, images and comments are kept but not displayed. The status bar says when a
   sheet has them.
 - Copy/paste moves values as text; formulas aren't adjusted when pasted. No fill

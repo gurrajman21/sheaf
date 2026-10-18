@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use ironcalc_base::expressions::types::Area;
 use ironcalc_base::types::{Color, HorizontalAlignment, VerticalAlignment};
 use ironcalc_base::{Model, UserModel};
+use ooxml::structural::StructuralOp;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -31,10 +32,18 @@ pub struct Session {
     sheet: u32,
     /// Per-sheet objects found in the file at open/save time.
     objects: Vec<(String, ooxml::inspect::SheetObjects)>,
-    /// Structural edits since the last open/save. The patch writer can't shift
-    /// references in charts, pivots etc. yet, and a moved block of cells looks
-    /// like ordinary cell edits to its diff, so these must never be patched.
+    /// Edits since the last open/save that the patch writer can't express
+    /// (sheet add/rename/delete). Saving after one needs a confirmed full rewrite.
     structural: Vec<&'static str>,
+    /// Row/column inserts and deletes since the last open/save, in order. The patch
+    /// writer replays them on its baseline and shifts every reference in the file.
+    ops: Vec<StructuralOp>,
+    /// Any row/column/sheet operation since the file was opened.
+    structural_ever: bool,
+    /// Undo/redo after a structural edit: the op log may no longer match the
+    /// model (a moved block of cells looks like plain edits to the diff), so the
+    /// next save must not be a patch.
+    ops_uncertain: bool,
 }
 
 #[derive(Serialize)]
@@ -138,7 +147,7 @@ impl Default for Session {
 impl Session {
     pub fn new() -> Self {
         let model = UserModel::new_empty("Book1", "en", "UTC", LANG).expect("empty workbook");
-        Session { model, original: None, path: None, dirty: false, sheet: 0, objects: Vec::new(), structural: Vec::new() }
+        Session { model, original: None, path: None, dirty: false, sheet: 0, objects: Vec::new(), structural: Vec::new(), ops: Vec::new(), structural_ever: false, ops_uncertain: false }
     }
 
     pub fn open(&mut self, path: &Path) -> Result<(), String> {
@@ -148,6 +157,9 @@ impl Session {
         self.model = UserModel::from_model(model);
         self.objects = ooxml::inspect::sheet_objects(&bytes).unwrap_or_default();
         self.structural.clear();
+        self.ops.clear();
+        self.structural_ever = false;
+        self.ops_uncertain = false;
         self.original = Some(bytes);
         self.path = Some(path.to_path_buf());
         self.dirty = false;
@@ -160,16 +172,14 @@ impl Session {
     pub fn save(&mut self, path: Option<PathBuf>, allow_lossy: bool) -> Result<Value, String> {
         let path = path.or_else(|| self.path.clone()).ok_or("no file name yet")?;
         let (bytes, mode, report) = match &self.original {
-            Some(_) if !self.structural.is_empty() && !allow_lossy => {
-                let what = self.structural.join(", ");
-                return Ok(json!({"saved": false, "needs_confirmation": true,
-                    "reason": format!("{what} can't be saved into the original file yet")}));
+            Some(_) if self.blocked().is_some() && !allow_lossy => {
+                return Ok(json!({"saved": false, "needs_confirmation": true, "reason": self.blocked()}));
             }
-            Some(_) if !self.structural.is_empty() => (native_bytes(self.model.get_model())?, "native", None),
+            Some(_) if self.blocked().is_some() => (native_bytes(self.model.get_model())?, "native", None),
             Some(orig) => {
                 let mut base = load_model(orig, "base")?;
                 base.evaluate();
-                match ooxml::save_patched(orig, &base, self.model.get_model()) {
+                match ooxml::patch::save_patched_ops(orig, &base, self.model.get_model(), &self.ops) {
                     Ok((bytes, report)) => (bytes, "patch", serde_json::to_value(report).ok()),
                     Err(reason) if !allow_lossy => {
                         return Ok(json!({"saved": false, "needs_confirmation": true, "reason": reason}));
@@ -186,10 +196,52 @@ impl Session {
         // the saved file is the new baseline for the next patch save
         self.objects = ooxml::inspect::sheet_objects(&bytes).unwrap_or_default();
         self.structural.clear();
+        self.ops.clear();
+        self.ops_uncertain = false;
         self.original = Some(bytes);
         self.path = Some(path.clone());
         self.dirty = false;
         Ok(json!({"saved": true, "mode": mode, "path": path.display().to_string(), "report": report}))
+    }
+
+    /// Why the next save can't be a patch, if it can't.
+    fn blocked(&self) -> Option<String> {
+        if !self.structural.is_empty() {
+            return Some(format!("{} can't be saved into the original file yet", self.structural.join(", ")));
+        }
+        if self.ops_uncertain {
+            return Some("Undoing or redoing after inserting or deleting rows, columns or sheets can't be saved into the original file yet".into());
+        }
+        None
+    }
+
+    /// Insert/delete rows or columns with undo, keeping the op log and defined names in step.
+    fn structural_op(&mut self, op: StructuralOp) -> Result<Value, String> {
+        let (sheet, at, count) = match op {
+            StructuralOp::InsertRows { sheet, at, count }
+            | StructuralOp::DeleteRows { sheet, at, count }
+            | StructuralOp::InsertCols { sheet, at, count }
+            | StructuralOp::DeleteCols { sheet, at, count } => (sheet, at, count),
+        };
+        match op {
+            StructuralOp::InsertRows { .. } => self.model.insert_rows(sheet, at, count)?,
+            StructuralOp::DeleteRows { .. } => self.model.delete_rows(sheet, at, count)?,
+            StructuralOp::InsertCols { .. } => self.model.insert_columns(sheet, at, count)?,
+            StructuralOp::DeleteCols { .. } => self.model.delete_columns(sheet, at, count)?,
+        }
+        // IronCalc shifts cell formulas but not defined names; shift them like the file will be
+        let name = self.model.get_worksheets_properties()[sheet as usize].name.clone();
+        let shift = op.to_shift(&name);
+        for (n, scope, formula) in self.model.get_defined_name_list() {
+            if let Some(f) = ooxml::refs::shift_formula(&formula, None, &shift) {
+                if f != formula {
+                    let _ = self.model.update_defined_name(&n, scope, &n, scope, &f);
+                }
+            }
+        }
+        self.ops.push(op);
+        self.structural_ever = true;
+        Ok(Value::Null)
     }
 
     pub fn info(&self) -> WorkbookInfo {
@@ -464,8 +516,12 @@ impl Session {
                 self.paste(rect.sheet, rect.row, rect.col, &arg::<String>(args, "text")?)
             }
             "stats" => Ok(self.selection_stats(&arg(args, "range")?)),
-            "undo" => self.model.undo().map(|_| Value::Null),
-            "redo" => self.model.redo().map(|_| Value::Null),
+            "undo" | "redo" => {
+                if self.structural_ever {
+                    self.ops_uncertain = true;
+                }
+                if cmd == "undo" { self.model.undo() } else { self.model.redo() }.map(|_| Value::Null)
+            }
             "add_sheet" => {
                 let r = self.model.new_sheet();
                 self.sheet = self.model.get_worksheets_properties().len() as u32 - 1;
@@ -479,10 +535,15 @@ impl Session {
                 self.sheet = self.sheet.min(n.saturating_sub(1));
                 r.map(|_| Value::Null)
             }
-            "insert_rows" => self.model.insert_rows(arg(args, "sheet")?, arg(args, "at")?, arg(args, "count")?).map(|_| Value::Null),
-            "delete_rows" => self.model.delete_rows(arg(args, "sheet")?, arg(args, "at")?, arg(args, "count")?).map(|_| Value::Null),
-            "insert_cols" => self.model.insert_columns(arg(args, "sheet")?, arg(args, "at")?, arg(args, "count")?).map(|_| Value::Null),
-            "delete_cols" => self.model.delete_columns(arg(args, "sheet")?, arg(args, "at")?, arg(args, "count")?).map(|_| Value::Null),
+            "insert_rows" | "delete_rows" | "insert_cols" | "delete_cols" => {
+                let (sheet, at, count) = (arg(args, "sheet")?, arg(args, "at")?, arg(args, "count")?);
+                self.structural_op(match cmd {
+                    "insert_rows" => StructuralOp::InsertRows { sheet, at, count },
+                    "delete_rows" => StructuralOp::DeleteRows { sheet, at, count },
+                    "insert_cols" => StructuralOp::InsertCols { sheet, at, count },
+                    _ => StructuralOp::DeleteCols { sheet, at, count },
+                })
+            }
             "set_col_width" => {
                 let (s, c0, c1, w): (u32, i32, i32, f64) = (arg(args, "sheet")?, arg(args, "from")?, arg(args, "to")?, arg(args, "width")?);
                 self.model.set_columns_width(s, c0, c1, w).map(|_| Value::Null)
@@ -499,13 +560,9 @@ impl Session {
         };
         if mutating && result.is_ok() {
             self.dirty = true;
-            let structural = match cmd {
-                "insert_rows" | "delete_rows" => Some("Inserting or deleting rows"),
-                "insert_cols" | "delete_cols" => Some("Inserting or deleting columns"),
-                "add_sheet" | "rename_sheet" | "delete_sheet" => Some("Adding, renaming or deleting sheets"),
-                _ => None,
-            };
-            if let Some(what) = structural {
+            if matches!(cmd, "add_sheet" | "rename_sheet" | "delete_sheet") {
+                self.structural_ever = true;
+                let what = "Adding, renaming or deleting sheets";
                 if !self.structural.contains(&what) {
                     self.structural.push(what);
                 }
@@ -564,20 +621,28 @@ mod tests {
     }
 
     #[test]
-    fn structural_edits_are_never_patched() {
+    fn row_inserts_are_patched_and_undo_forces_a_rewrite() {
         let dir = std::env::temp_dir().join(format!("sheets-core-struct-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("s.xlsx");
         let mut s = Session::new();
         call(&mut s, "set_input", json!({"cell": {"sheet": 0, "row": 1, "col": 1}, "value": "a"}));
+        call(&mut s, "set_input", json!({"cell": {"sheet": 0, "row": 2, "col": 1}, "value": "=A1&\"!\""}));
         call(&mut s, "save", json!({"path": path.display().to_string()}));
-        call(&mut s, "insert_rows", json!({"sheet": 0, "at": 1, "count": 1}));
+        // inserted row is patched, and the formula follows its input
+        call(&mut s, "insert_rows", json!({"sheet": 0, "at": 2, "count": 1}));
         let r = call(&mut s, "save", json!({}));
-        assert_eq!(r["needs_confirmation"], true, "{r}");
-        let r = call(&mut s, "save", json!({"allow_lossy": true}));
-        assert_eq!(r["mode"], "native");
-        call(&mut s, "set_input", json!({"cell": {"sheet": 0, "row": 5, "col": 1}, "value": "b"}));
-        assert_eq!(call(&mut s, "save", json!({}))["mode"], "patch", "flag clears after a save");
+        assert_eq!(r["mode"], "patch", "{r}");
+        let mut t = Session::new();
+        call(&mut t, "open", json!({"path": path.display().to_string()}));
+        assert_eq!(call(&mut t, "input", json!({"cell": {"sheet": 0, "row": 3, "col": 1}})), "=A1&\"!\"");
+        // undo after a structural edit: the op log can't be trusted, so ask first
+        call(&mut s, "undo", json!({}));
+        assert_eq!(call(&mut s, "save", json!({}))["needs_confirmation"], true);
+        assert_eq!(call(&mut s, "save", json!({"allow_lossy": true}))["mode"], "native");
+        // sheet changes still need a rewrite
+        call(&mut s, "add_sheet", json!({}));
+        assert_eq!(call(&mut s, "save", json!({}))["needs_confirmation"], true);
         std::fs::remove_dir_all(dir).ok();
     }
 
