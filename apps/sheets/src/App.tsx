@@ -181,24 +181,33 @@ export default function App() {
   // close guard + drag-and-drop open (desktop app only)
   const infoRef = useRef(info);
   infoRef.current = info;
+  // registered once; handlers read the latest state through refs
+  const dropRef = useRef<(file: string) => void>(() => {});
+  dropRef.current = (file) => { guardUnsaved().then((ok) => { if (ok) openPath(file); }); };
   useEffect(() => {
     if (!isTauri) return;
-    let unlisten: (() => void)[] = [];
+    let cancelled = false;
+    const unlisten: (() => void)[] = [];
     import("@tauri-apps/api/window").then(async ({ getCurrentWindow }) => {
       const win = getCurrentWindow();
-      unlisten.push(await win.onCloseRequested(async (e) => {
-        const i = infoRef.current;
-        if (i?.dirty && !(await confirmAction(`Your changes to ${i.name} haven't been saved.`, "Close without saving?", "Close without saving"))) e.preventDefault();
-      }));
-      unlisten.push(await win.onDragDropEvent((ev) => {
-        if (ev.payload.type === "drop") {
+      const subs = [
+        // Tauri destroys the window after this handler unless it calls preventDefault
+        await win.onCloseRequested(async (e) => {
+          const i = infoRef.current;
+          if (i?.dirty && !(await confirmAction(`Your changes to ${i.name} haven't been saved.`, "Close without saving?", "Close without saving"))) e.preventDefault();
+        }),
+        await win.onDragDropEvent((ev) => {
+          if (ev.payload.type !== "drop") return;
           const file = ev.payload.paths.find((p) => /\.xls[xm]$/i.test(p));
-          if (file) guardUnsaved().then((ok) => { if (ok) openPath(file); });
-        }
-      }));
+          if (file) dropRef.current(file);
+        }),
+      ];
+      // the effect may have been cleaned up (StrictMode) before registration finished
+      if (cancelled) subs.forEach((u) => u());
+      else unlisten.push(...subs);
     });
-    return () => { unlisten.forEach((u) => u()); unlisten = []; };
-  }, [guardUnsaved, openPath]);
+    return () => { cancelled = true; unlisten.forEach((u) => u()); };
+  }, []);
 
   // global shortcuts (work from the formula bar too)
   useEffect(() => {
