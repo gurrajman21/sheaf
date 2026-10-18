@@ -25,3 +25,19 @@ tools/fidelity/.lo-profile/
 node_modules/
 apps/sheets/dist/
 apps/sheets/src-tauri/gen/
+
+# Private notes and local tooling (not for the public repo)
+PLAN.md
+SUMMARY.md
+NOTES.md
+*.local.md
+.claude/
+CLAUDE.md
+CLAUDE.local.md
+
+# Editors and env
+.vscode/
+.idea/
+*.swp
+.env
+.env.*

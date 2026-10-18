@@ -12,6 +12,11 @@ brew install --cask libreoffice   # for the LibreOffice engine and --visual
 cargo build --release             # builds target/release/ooxml_runner (IronCalc engines)
 ```
 
+The harness is a development tool and is not part of the Sheaf app. Some of what it
+installs uses other licenses: PyMuPDF (for the `--visual` diff) is AGPL-3.0, and
+LibreOffice is MPL-2.0. Neither is bundled with or linked into Sheaf, so they don't
+affect Sheaf's own license.
+
 ## Engines
 
 | Engine | What it is |
