@@ -82,9 +82,10 @@ class LibreOffice:
     launch constraint), so engines/lo_runner.py runs as an in-process macro that
     serves jobs from a folder. See lo_runner.py for the protocol.
     """
-    MACRO = "vnd.sun.star.script:lo_runner.py$serve?language=Python&location=user"
+    SCRIPT = "lo_runner.py"
 
     def __init__(self):
+        self.MACRO = f"vnd.sun.star.script:{self.SCRIPT}$serve?language=Python&location=user"
         self.name = f"fidelity_lo_{os.getpid()}_{uuid.uuid4().hex[:6]}"
         self.profile = HERE / ".lo-profile" / self.name
         self.jobs = self.profile / "jobs"
@@ -103,7 +104,7 @@ class LibreOffice:
             self.prewarmed = True
         scripts = self.profile / "user" / "Scripts" / "python"
         scripts.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(HERE / "engines" / "lo_runner.py", scripts / "lo_runner.py")
+        shutil.copy2(HERE / "engines" / self.SCRIPT, scripts / self.SCRIPT)
         shutil.rmtree(self.jobs, ignore_errors=True)
         self.jobs.mkdir(parents=True)
         self.proc = subprocess.Popen(self._cmd(self.MACRO), env={**os.environ, "FIDELITY_JOBS": str(self.jobs)},

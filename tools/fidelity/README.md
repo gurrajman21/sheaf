@@ -100,3 +100,72 @@ cd tools/fidelity
 - `rescore.py`: recompute fidelity for a finished run after changing `compare.py`
 - `run.py`: parallel driver, one headless soffice per worker
 - `report.py`: `summary.md` scorecard
+
+# .docx harness (Phase D0)
+
+Same idea for Word files: which engine opens them, lays them out like Word, and saves
+edits without damaging anything else?
+
+## Setup
+
+```bash
+tools/fidelity/.venv/bin/pip install lxml
+cd tools/fidelity
+.venv/bin/python fetch_public_docx.py        # POI, LibreOffice Writer and python-docx test files
+.venv/bin/python gen_synthetic_docx.py       # one file per Word feature
+git clone --depth 1 https://gitlab.com/Ryujiyasu/oxi.git .engines/oxi   # Oxi source (path dependency)
+(cd docx_bench && cargo build --release)     # Rust runner for rdocx (crates.io) and Oxi
+```
+
+## Engines
+
+| Engine | What it is |
+|---|---|
+| `rdocx` | rdocx 0.16 (MIT/Apache): own model, native layout, keeps unknown XML |
+| `oxi` | Oxi (MPL-2.0): Rust layout engine, patches edits into the original zip |
+| `oxi+hints` | Oxi laying out the original file, *with* Word's cached page breaks (see below) |
+| `libreoffice` | LibreOffice Writer, via the in-process macro `engines/lo_docx_runner.py` |
+| `sheaf` | Sheaf's patch-in-place writer (`crates/ooxml/src/docx`) for saving, Oxi for layout. Edited files are reopened in rdocx, Oxi and LibreOffice |
+| `sheaf-track` | Same edits recorded as tracked changes (`w:ins`/`w:del`/`w:rPrChange`) |
+| `sheaf-accept` / `sheaf-reject` | Accept / reject every tracked change (files that have any). Checked: none left, and the text equals Word's "No Markup" / "Original" view of the original |
+| `sheaf-stories` | Append to the first header, add a footnote, make the edit paragraph a numbered list item, insert an inline picture |
+
+## Ground truth without Word
+
+- Word-saved files: `docProps/app.xml` `<Pages>` is Word's page count, and
+  `<w:lastRenderedPageBreak/>` marks where Word broke each page. When both agree
+  (pages = markers + 1) the file is *trusted* and every page start is checked.
+- Synthetic files with only hard breaks list their pages in `corpus/docx/synthetic/expected.json`.
+- **Blind layout:** Oxi reads `lastRenderedPageBreak` as a layout input, so every engine lays
+  out a copy with those markers removed. `oxi+hints` shows the score with them.
+
+## Run
+
+```bash
+.venv/bin/python run_docx.py --jobs 8                      # rdocx, Oxi, LibreOffice
+.venv/bin/python run_docx.py --engines sheaf,sheaf-track   # Sheaf's own writer
+.venv/bin/python run_docx.py --engines sheaf-accept,sheaf-reject,sheaf-stories
+.venv/bin/python run_docx.py --corpus synthetic --keep     # keep each engine's output files
+.venv/bin/python report_docx.py ../../results/docx-<run>   # summary.md scorecard
+```
+
+## What's measured
+
+- **Opens**, crashes and timeouts (every engine runs in its own process).
+- **Page count** vs Word, and **page starts**: the first 12 non-space characters of each page
+  must match the text after Word's page break.
+- **Round trip** (open, save, no edits): every top-level body element compared as exclusive C14N
+  with rsids, `proofErr` and cached page breaks removed; other parts byte-equal or C14N-equal;
+  dropped parts and relationships; a feature inventory (tables, drawings, fields, comments,
+  tracked changes, footnotes, content controls, equations, ...).
+- **Edits**: bold the first run of a plain paragraph, append text to it, insert a paragraph
+  after it, retype the first table's first cell. Each must land, and everything else must
+  survive as in the round trip.
+
+## Files
+
+- `docx_xml.py`: text in reading order, Word's hints, inventory, canonical XML
+- `docx_compare.py`: page matching, edit target and checks, survival
+- `docx_bench/`: Rust runner (`docx_bench <job.json>`), its own cargo workspace
+- `engines/lo_docx_runner.py`: LibreOffice Writer job-server macro
+- `run_docx.py`, `report_docx.py`: driver and scorecard

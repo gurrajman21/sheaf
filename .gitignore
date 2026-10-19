@@ -25,6 +25,8 @@ tools/fidelity/.lo-profile/
 node_modules/
 apps/sheets/dist/
 apps/sheets/src-tauri/gen/
+apps/docs/dist/
+apps/docs/src-tauri/gen/
 
 # Private notes and local tooling (not for the public repo)
 PLAN.md
@@ -41,3 +43,9 @@ CLAUDE.local.md
 *.swp
 .env
 .env.*
+
+# Word processor test corpus and engine sources (fetched locally)
+corpus/docx/*
+!corpus/docx/SOURCES.lock
+tools/fidelity/.engines/
+tools/fidelity/docx_bench/target/

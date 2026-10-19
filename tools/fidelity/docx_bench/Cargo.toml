@@ -1,0 +1,20 @@
+# Phase D0 engine runner for the .docx harness. Its own workspace, so the main build
+# doesn't depend on the engine sources fetched into ../.engines.
+[package]
+name = "docx_bench"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace]
+
+[dependencies]
+rdocx = "0.16.2"
+rdocx-layout = "0.16.2"
+oxidocs-core = { path = "../.engines/oxi/crates/oxidocs-core" }
+serde_json = "1"
+ooxml = { path = "../../../crates/ooxml" }
+
+[profile.release]
+opt-level = 3

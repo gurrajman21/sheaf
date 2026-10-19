@@ -1,17 +1,20 @@
 # Sheaf
 
-A free, open-source desktop spreadsheet editor for Excel files.
+Free, open-source desktop editors for Office files that don't break them.
 
-Sheaf opens and edits `.xlsx` and `.xlsm` workbooks and saves them back without
-damaging what it doesn't understand. Most editors rebuild the whole file on save,
-which drops charts, pivot tables, comments or macros they can't handle. Sheaf
-patches your edits into the original file instead, so everything else stays exactly
-as Excel wrote it.
+- **Sheaf** edits Excel workbooks (`.xlsx`, `.xlsm`), calculated by the
+  [IronCalc](https://github.com/ironcalc/IronCalc) engine.
+- **Quire** edits Word documents (`.docx`) on real pages laid out by the
+  [Oxi](https://gitlab.com/Ryujiyasu/oxi) engine.
 
-It runs as a native desktop app (Tauri + React) with the
-[IronCalc](https://github.com/ironcalc/IronCalc) engine for calculation.
+Most editors rebuild the whole file on save, which drops charts, pivot tables,
+comments, tracked changes or macros they can't handle. Both apps patch your edits into
+the original file instead, so everything else stays exactly as Office wrote it. They run
+as native desktop apps (Tauri + React) and share one look.
 
 ## Features
+
+### Sheaf (spreadsheets)
 
 - Ribbon UI with a ⌘K command palette, a start screen with templates, and dark mode
 - About 400 Excel functions with live recalculation, formula autocomplete and argument hints
@@ -22,6 +25,16 @@ It runs as a native desktop app (Tauri + React) with the
 - Insert and delete rows, columns and sheets, freeze panes, hide/unhide, print to PDF
 
 See [apps/sheets/README.md](apps/sheets/README.md) for the full feature list and known limits.
+
+### Quire (documents)
+
+- Real pages with Word-accurate layout; edit body text, tables, headers, footers, footnotes and text boxes
+- Comments with replies, track changes with per-change accept/reject, spell check
+- Styles, lists, spacing, format painter, find and replace, copy/paste with formatting
+- Page setup, table tools, table of contents, footnotes, page numbers, links, headings pane
+- Slash menu for quick inserts, autosave with crash recovery, version history, print to PDF
+
+See [apps/docs/README.md](apps/docs/README.md) for details and known limits.
 
 ## Install
 
@@ -36,47 +49,50 @@ minutes the first time.
 - **Windows / Linux:** the system packages listed in Tauri's
   [prerequisites guide](https://v2.tauri.app/start/prerequisites/)
 
-### 2. Build the app
+### 2. Build the apps
 
 ```bash
 git clone https://github.com/gurrajman21/sheaf.git
-cd sheaf/apps/sheets
-npm install
-npx tauri build --bundles app
+cd sheaf/apps/sheets && npm install && npx tauri build --bundles app
+cd ../docs && npm install && npx tauri build --bundles app
 ```
 
-The app is written to `target/release/bundle/macos/Sheaf.app` at the repository root.
+The apps are written to `target/release/bundle/macos/Sheaf.app` and `Quire.app` at the
+repository root. Quire's first build also downloads and compiles Oxi, which takes a few
+minutes.
 On Windows or Linux, drop `--bundles app` to get that platform's installer in
 `target/release/bundle/`.
 
 ### 3. Install it (macOS)
 
 ```bash
-cp -R ../../target/release/bundle/macos/Sheaf.app /Applications/
+cp -R ../../target/release/bundle/macos/Sheaf.app ../../target/release/bundle/macos/Quire.app /Applications/
 ```
 
-Then open Sheaf from Spotlight, Launchpad or the Applications folder. The app is not
-signed with an Apple developer certificate. If macOS says it can't be opened,
-right-click Sheaf in Applications, choose **Open**, then confirm.
+Then open them from Spotlight, Launchpad or the Applications folder. The apps are not
+signed with an Apple developer certificate. If macOS says one can't be opened,
+right-click it in Applications, choose **Open**, then confirm.
 
-To make Sheaf the default for spreadsheets, right-click any `.xlsx` file in Finder,
-choose **Get Info**, set **Open with** to Sheaf and click **Change All**.
+To make them the defaults, right-click an `.xlsx` (or `.docx`) file in Finder, choose
+**Get Info**, set **Open with** to Sheaf (or Quire) and click **Change All**.
 
 To update, pull the latest code and repeat steps 2 and 3.
 
 ## Development
 
 ```bash
-cd apps/sheets
-npx tauri dev          # native window with hot reload
+cd apps/sheets && npx tauri dev    # or apps/docs: native window with hot reload
 ```
 
-The UI also runs in a normal browser against the real Rust backend, which is handy
+Both UIs also run in a normal browser against the real Rust backend, which is handy
 for UI work:
 
 ```bash
 cargo run -p sheets-core --bin sheets_dev_server -- 7878 path/to/book.xlsx
 cd apps/sheets && npx vite      # open http://localhost:1420
+
+cargo run --release -p docs-core --bin docs_dev_server -- 7879 path/to/doc.docx
+cd apps/docs && npx vite        # open http://localhost:1421
 ```
 
 Run the tests with `cargo test --workspace` and type-check the UI with
@@ -86,10 +102,12 @@ Run the tests with `cargo test --workspace` and type-check the UI with
 
 | Path | What it is |
 |---|---|
-| `apps/sheets/` | The desktop app: React UI in `src/`, Tauri shell in `src-tauri/` |
-| `crates/sheets-core/` | Workbook session and every UI command; decides how to save |
-| `crates/ooxml/` | The patch-in-place `.xlsx` writer: diffs the workbook and splices only changed XML |
-| `tools/fidelity/` | Test harness that measures how well files survive open, edit and save ([README](tools/fidelity/README.md)) |
+| `apps/sheets/` | Sheaf: React UI in `src/`, Tauri shell in `src-tauri/` |
+| `apps/docs/` | Quire: canvas page view and editor UI in `src/`, Tauri shell in `src-tauri/` |
+| `crates/sheets-core/` | Workbook session and every spreadsheet command; decides how to save |
+| `crates/docs-core/` | Document session, editing commands, undo, page layout through Oxi |
+| `crates/ooxml/` | The patch-in-place writers: `.xlsx` (diff and splice changed cells) and `.docx` (`docx/`: paragraph splicing, text and formatting edits, tracked changes, stories) |
+| `tools/fidelity/` | Test harnesses that measure how well `.xlsx` and `.docx` files survive open, edit and save ([README](tools/fidelity/README.md)) |
 | `corpus/` | Test workbooks, generated or fetched locally (not committed) |
 
 ## Contributing
@@ -99,8 +117,8 @@ harness in `tools/fidelity` before and after, and include the numbers in your pu
 
 ## Roadmap
 
-Spreadsheets come first. A word processor and a presentation editor built on the same
-approach are planned.
+Spreadsheets (Sheaf) came first, the word processor (Quire) second. A presentation editor
+built on the same approach is planned.
 
 ## License
 
@@ -121,6 +139,8 @@ Sheaf is built on the work of other open-source projects, including:
 
 - [IronCalc](https://github.com/ironcalc/IronCalc): the spreadsheet engine that parses
   and calculates workbooks (MIT OR Apache-2.0)
+- [Oxi](https://gitlab.com/Ryujiyasu/oxi): the document layout engine behind Quire's pages
+  (MPL-2.0, used unmodified as a dependency)
 - [Tauri](https://tauri.app): the native desktop shell (MIT OR Apache-2.0)
 - [React](https://react.dev) (MIT) and [Lucide](https://lucide.dev) icons (ISC)
 - [zip](https://github.com/zip-rs/zip2) and [quick-xml](https://github.com/tafia/quick-xml)
