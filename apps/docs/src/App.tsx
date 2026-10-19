@@ -10,7 +10,7 @@ import { htmlToParas } from "./richtext";
 import { confirmAction, pickOpenPath, pickSavePath } from "./files";
 import { anchoredItems, caretRect, lineEdge, lineNav, PAD, paraLength, readingOrder, type Placed } from "./geometry";
 import { AppMark } from "./icons";
-import { nativeMenu, onMenuAction, openUrl, printWindow } from "./native";
+import { nativeMenu, onMenuAction, onOpenedFiles, openUrl, printWindow } from "./native";
 import { Palette, type PaletteItem } from "./Palette";
 import { PageView, type Mark, type PageViewHandle } from "./PageView";
 import { Ribbon, STYLES, type Action } from "./Ribbon";
@@ -769,6 +769,10 @@ export default function App() {
   infoRef.current = info;
   const dropRef = useRef<(f: string) => void>(() => {});
   dropRef.current = (f) => { guardUnsaved().then((ok) => { if (ok) openPath(f); }); };
+  useEffect(() => onOpenedFiles((paths) => {
+    const file = paths.filter((p) => /\.doc[xm]$/i.test(p)).pop();
+    if (file) dropRef.current(file);
+  }), []);
   useEffect(() => {
     if (!isTauri) return;
     let cancelled = false;

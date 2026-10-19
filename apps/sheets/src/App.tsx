@@ -10,7 +10,7 @@ import { FUNCTIONS, REF_COLORS, adjustDecimals, callAtCaret, formulaRefs, sugges
 import { cellName, colName, makeGeometry, normRect, parseCellName, selectionName, type Selection } from "./geometry";
 import { Grid, type Editing, type Ref } from "./Grid";
 import { AppMark } from "./icons";
-import { nativeMenu, onMenuAction, printWindow, type MenuEntry } from "./native";
+import { nativeMenu, onMenuAction, onOpenedFiles, printWindow, type MenuEntry } from "./native";
 import { Palette, type PaletteItem } from "./Palette";
 import { FilterPopover, ListPopover } from "./Popovers";
 import { Ribbon, type Action } from "./Ribbon";
@@ -360,6 +360,10 @@ export default function App() {
   infoRef.current = info;
   const dropRef = useRef<(file: string) => void>(() => {});
   dropRef.current = (file) => { guardUnsaved().then((ok) => { if (ok) openPath(file); }); };
+  useEffect(() => onOpenedFiles((paths) => {
+    const file = paths.filter((p) => /\.xls[xm]$/i.test(p)).pop();
+    if (file) dropRef.current(file);
+  }), []);
   useEffect(() => {
     if (!isTauri) return;
     let cancelled = false;

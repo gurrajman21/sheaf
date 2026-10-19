@@ -41,6 +41,20 @@ export function onMenuAction(handler: (id: string) => void): () => void {
   return () => { cancelled = true; unlisten?.(); };
 }
 
+/** Files the OS asked the app to open (Finder's Open With, double-click). Delivers any that
+ *  arrived before the UI loaded, then each new batch. */
+export function onOpenedFiles(handler: (paths: string[]) => void): () => void {
+  if (!isTauri) return () => {};
+  let unlisten: (() => void) | null = null;
+  let cancelled = false;
+  const take = () => invoke<string[]>("take_opened").then((paths) => { if (!cancelled && paths.length) handler(paths); }).catch(() => {});
+  import("@tauri-apps/api/event").then(({ listen }) => listen("opened", take)).then((u) => {
+    if (cancelled) u();
+    else { unlisten = u; void take(); }
+  });
+  return () => { cancelled = true; unlisten?.(); };
+}
+
 export async function printWindow(): Promise<void> {
   if (isTauri) await invoke("print_window");
   else window.print();

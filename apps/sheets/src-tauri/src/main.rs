@@ -131,8 +131,20 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     Menu::with_items(app, &[&app_menu, &file, &edit, &view, &insert, &format, &data, &window])
 }
 
+/// Files macOS asked us to open (Finder's Open With, double-click, dropping on the Dock
+/// icon). They arrive as an event, not as arguments, possibly before the UI has loaded,
+/// so they wait here until the UI takes them.
+#[derive(Default)]
+struct OpenedFiles(Mutex<Vec<String>>);
+
+#[tauri::command]
+fn take_opened(opened: State<'_, OpenedFiles>) -> Vec<String> {
+    std::mem::take(&mut *opened.0.lock().unwrap())
+}
+
 fn main() {
     tauri::Builder::default()
+        .manage(OpenedFiles::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .setup(|app| {
@@ -152,7 +164,21 @@ fn main() {
             // the UI owns every action; standard items (cut/copy/paste...) never get here
             let _ = app.emit("menu", event.id().0.clone());
         })
-        .invoke_handler(tauri::generate_handler![api, print_window])
-        .run(tauri::generate_context!())
-        .expect("error while running Sheaf");
+        .invoke_handler(tauri::generate_handler![api, print_window, take_opened])
+        .build(tauri::generate_context!())
+        .expect("error while building Sheaf")
+        .run(|_app, _event| {
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Opened { urls } = _event {
+                let paths: Vec<String> = urls.iter().filter_map(|u| u.to_file_path().ok()).map(|p| p.to_string_lossy().into_owned()).collect();
+                if !paths.is_empty() {
+                    _app.state::<OpenedFiles>().0.lock().unwrap().extend(paths);
+                    let _ = _app.emit("opened", ());
+                    if let Some(w) = _app.get_webview_window("main") {
+                        let _ = w.unminimize();
+                        let _ = w.set_focus();
+                    }
+                }
+            }
+        });
 }
